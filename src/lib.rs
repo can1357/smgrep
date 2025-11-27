@@ -7,6 +7,7 @@ pub mod file;
 pub mod format;
 pub mod git;
 pub mod grammar;
+pub mod ipc;
 pub mod meta;
 pub mod search;
 pub mod store;

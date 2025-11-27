@@ -1,7 +1,11 @@
+pub mod claude_install;
 pub mod doctor;
 pub mod index;
-pub mod install_claude;
 pub mod list;
+pub mod mcp;
 pub mod search;
 pub mod serve;
 pub mod setup;
+pub mod status;
+pub mod stop;
+pub mod stop_all;

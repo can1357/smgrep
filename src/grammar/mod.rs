@@ -2,7 +2,6 @@ use std::{
    collections::HashMap,
    fs,
    path::{Path, PathBuf},
-   sync::Arc,
 };
 
 use parking_lot::RwLock;

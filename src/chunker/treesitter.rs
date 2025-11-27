@@ -1,8 +1,7 @@
-use std::{fs, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 
-use parking_lot::Mutex;
 use regex::Regex;
-use tree_sitter::{Language, Parser, WasmStore};
+use tree_sitter::Language;
 
 use crate::{
    chunker::{

@@ -1,11 +1,12 @@
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, process::Command, time::Duration};
 
 use anyhow::{Context, Result};
 use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
+use tokio::net::UnixStream;
 
-use crate::store::Store as RsgrepStore;
+use crate::ipc::{self, Request, Response};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct SearchResult {
@@ -46,15 +47,20 @@ pub async fn execute(
    let root = std::env::current_dir().context("failed to get current directory")?;
    let search_path = path.unwrap_or_else(|| root.clone());
 
-   if json && let Some(results) = try_server_fastpath(&query, max, !no_rerank, &search_path).await?
-   {
-      println!("{}", serde_json::to_string(&JsonOutput { results })?);
-      return Ok(());
-   }
-
    let resolved_store_id = store_id
       .map(Ok)
       .unwrap_or_else(|| crate::git::resolve_store_id(&search_path))?;
+
+   if let Some(results) =
+      try_daemon_search(&query, max, !no_rerank, &search_path, &resolved_store_id).await?
+   {
+      if json {
+         println!("{}", serde_json::to_string(&JsonOutput { results })?);
+      } else {
+         format_results(&results, &query, &root, content, compact, scores, plain)?;
+      }
+      return Ok(());
+   }
 
    if dry_run {
       if json {
@@ -82,7 +88,8 @@ pub async fn execute(
       spinner.finish_with_message("Sync complete");
    }
 
-   let results = perform_search(&query, &search_path, &resolved_store_id, max, per_file, !no_rerank).await?;
+   let results =
+      perform_search(&query, &search_path, &resolved_store_id, max, per_file, !no_rerank).await?;
 
    if results.is_empty() {
       if !json {
@@ -105,53 +112,92 @@ pub async fn execute(
    Ok(())
 }
 
-async fn try_server_fastpath(
+async fn try_daemon_search(
    query: &str,
    max: usize,
    rerank: bool,
    path: &PathBuf,
+   store_id: &str,
 ) -> Result<Option<Vec<SearchResult>>> {
-   let port = std::env::var("RSGREP_PORT").unwrap_or_else(|_| "4444".to_string());
-   let base_url = format!("http://localhost:{}", port);
+   let socket_path = ipc::socket_path(store_id);
 
-   let client = reqwest::Client::builder()
-      .timeout(Duration::from_millis(100))
-      .build()?;
+   let stream = match UnixStream::connect(&socket_path).await {
+      Ok(s) => s,
+      Err(_) => {
+         spawn_daemon(path)?;
 
-   if let Ok(response) = client.get(format!("{}/health", base_url)).send().await
-      && response.status().is_success()
-   {
-      #[derive(Serialize)]
-      struct SearchRequest {
-         query:  String,
-         limit:  usize,
-         rerank: bool,
-         path:   String,
-      }
-
-      let search_response = client
-         .post(format!("{}/search", base_url))
-         .json(&SearchRequest {
-            query: query.to_string(),
-            limit: max,
-            rerank,
-            path: path.to_string_lossy().to_string(),
-         })
-         .send()
-         .await?;
-
-      if search_response.status().is_success() {
-         #[derive(Deserialize)]
-         struct ServerResponse {
-            results: Vec<SearchResult>,
+         for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if let Ok(s) = UnixStream::connect(&socket_path).await {
+               return send_search_request(s, query, max, rerank, path)
+                  .await
+                  .map(Some);
+            }
          }
 
-         let payload: ServerResponse = search_response.json().await?;
-         return Ok(Some(payload.results));
-      }
-   }
+         return Ok(None);
+      },
+   };
 
-   Ok(None)
+   send_search_request(stream, query, max, rerank, path)
+      .await
+      .map(Some)
+}
+
+async fn send_search_request(
+   mut stream: UnixStream,
+   query: &str,
+   max: usize,
+   rerank: bool,
+   path: &PathBuf,
+) -> Result<Vec<SearchResult>> {
+   let request = Request::Search {
+      query: query.to_string(),
+      limit: max,
+      path: Some(path.to_string_lossy().to_string()),
+      rerank,
+   };
+
+   let mut buffer = ipc::SocketBuffer::new();
+   buffer.send(&mut stream, &request).await?;
+   let response: Response = buffer.recv(&mut stream).await?;
+
+   match response {
+      Response::Search(search_response) => {
+         let results = search_response
+            .results
+            .into_iter()
+            .map(|r| SearchResult {
+               path:       r.path,
+               score:      r.score,
+               content:    r.content,
+               chunk_type: r.chunk_type.map(|ct| format!("{:?}", ct).to_lowercase()),
+               start_line: Some(r.start_line as usize),
+               end_line:   Some((r.start_line + r.num_lines) as usize),
+               is_anchor:  r.is_anchor,
+            })
+            .collect();
+         Ok(results)
+      },
+      Response::Error { message } => anyhow::bail!("server error: {}", message),
+      _ => anyhow::bail!("unexpected response from server"),
+   }
+}
+
+fn spawn_daemon(path: &PathBuf) -> Result<()> {
+   let exe = std::env::current_exe().context("failed to get current executable")?;
+
+   Command::new(&exe)
+      .arg("serve")
+      .arg("--path")
+      .arg(path)
+      .stdin(std::process::Stdio::null())
+      .stdout(std::process::Stdio::null())
+      .stderr(std::process::Stdio::null())
+      .spawn()
+      .context("failed to spawn daemon")?;
+
+   Ok(())
 }
 
 async fn perform_search(
@@ -162,24 +208,20 @@ async fn perform_search(
    per_file: usize,
    rerank: bool,
 ) -> Result<Vec<SearchResult>> {
-
    let store = std::sync::Arc::new(crate::store::LanceStore::new()?);
    let embedder = std::sync::Arc::new(crate::embed::worker::EmbedWorker::new()?);
 
-   if RsgrepStore::is_empty(&*store, &store_id).await? {
-      let fs = crate::file::LocalFileSystem::new();
-      let chunker = crate::chunker::treesitter::TreeSitterChunker::new();
+   let fs = crate::file::LocalFileSystem::new();
+   let chunker = crate::chunker::treesitter::TreeSitterChunker::new();
+   let sync_engine = crate::sync::SyncEngine::new(fs, chunker, embedder.clone(), store.clone());
 
-      let sync_engine = crate::sync::SyncEngine::new(fs, chunker, embedder.clone(), store.clone());
-
-      sync_engine
-         .initial_sync(&store_id, path, false, None)
-         .await?;
-   }
+   sync_engine
+      .initial_sync(store_id, path, false, None)
+      .await?;
 
    let engine = crate::search::SearchEngine::new(store, embedder);
    let response = engine
-      .search(&store_id, query, max, per_file, None, rerank)
+      .search(store_id, query, max, per_file, None, rerank)
       .await?;
 
    let root_str = path.to_string_lossy().to_string();
@@ -246,12 +288,16 @@ fn format_results(
       let lines: Vec<&str> = result.content.lines().collect();
       let total_lines = lines.len();
       let show_all = content || total_lines <= MAX_PREVIEW_LINES;
-      let display_lines = if show_all { total_lines } else { MAX_PREVIEW_LINES };
+      let display_lines = if show_all {
+         total_lines
+      } else {
+         MAX_PREVIEW_LINES
+      };
       let line_num_width = format!("{}", start_line + display_lines).len();
 
       if !plain {
          print!("{}", style(format!("{}) ", i + 1)).bold().cyan());
-         print!("📂 {}", style(format!("{}:{}", &result.path, start_line)).green());
+         print!("{}:{}", style(&result.path).green(), start_line);
 
          if scores {
             print!(" {}", style(format!("(score: {:.3})", result.score)).dim());
@@ -264,7 +310,7 @@ fn format_results(
             println!(
                "{:>width$} {} {}",
                style(line_num).dim(),
-               style("│").dim(),
+               style("|").dim(),
                line,
                width = line_num_width
             );
@@ -275,13 +321,13 @@ fn format_results(
             println!(
                "{:>width$} {} {}",
                "",
-               style("│").dim(),
+               style("|").dim(),
                style(format!("... (+{} more lines)", remaining)).dim(),
                width = line_num_width
             );
          }
       } else {
-         print!("{}) 📂 {}:{}", i + 1, result.path, start_line);
+         print!("{}) {}:{}", i + 1, result.path, start_line);
 
          if scores {
             print!(" (score: {:.3})", result.score);
@@ -291,17 +337,12 @@ fn format_results(
 
          for (j, line) in lines.iter().take(display_lines).enumerate() {
             let line_num = start_line + j;
-            println!("{:>width$} │ {}", line_num, line, width = line_num_width);
+            println!("{:>width$} | {}", line_num, line, width = line_num_width);
          }
 
          if !show_all {
             let remaining = total_lines - display_lines;
-            println!(
-               "{:>width$} │ ... (+{} more lines)",
-               "",
-               remaining,
-               width = line_num_width
-            );
+            println!("{:>width$} | ... (+{} more lines)", "", remaining, width = line_num_width);
          }
       }
 

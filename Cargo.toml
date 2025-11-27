@@ -54,14 +54,12 @@ notify = "8.2"
 notify-debouncer-mini = "0.7"
 walkdir = "2"
 
-# Git
+# Git & Networking
 git2 = "0.20"
-
-# HTTP server
-axum = "0.8"
-tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
 reqwest = { version = "0.12", features = ["json"] }
+
+# IPC
+postcard = { version = "1", features = ["alloc"] }
 
 # Utilities
 serde = { version = "1", features = ["derive"] }
@@ -88,6 +86,7 @@ hex = "0.4"
 regex = "1"
 rustc_version_runtime = "0.3"
 is-terminal = "0.4"
+smallvec = "1.15.1"
 
 [dev-dependencies]
 tempfile = "3"

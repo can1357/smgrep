@@ -111,7 +111,7 @@ async fn download_models(models_dir: &PathBuf) -> Result<()> {
 async fn download_grammars(grammars_dir: &PathBuf) -> Result<()> {
    let grammar_manager = GrammarManager::with_auto_download(false)?;
 
-   for (lang, url) in GRAMMAR_URLS {
+   for (lang, _url) in GRAMMAR_URLS {
       let grammar_path = grammars_dir.join(format!("tree-sitter-{}.wasm", lang));
 
       if grammar_path.exists() {

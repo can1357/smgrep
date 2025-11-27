@@ -14,6 +14,15 @@ use crate::{
    types::{PreparedChunk, SyncProgress, VectorRecord},
 };
 
+fn get_mtime(path: &Path) -> u64 {
+   path.metadata()
+      .and_then(|m| m.modified())
+      .ok()
+      .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+      .map(|d| d.as_secs())
+      .unwrap_or(0)
+}
+
 pub struct SyncEngine<F: FileSystem, C: Chunker, E: Embedder, S: Store> {
    file_system: F,
    chunker:     C,
@@ -80,10 +89,18 @@ where
 
       let hash_results: Vec<_> = files
          .par_iter()
-         .map(|file_path| {
+         .filter_map(|file_path| {
+            let path_str = file_path.to_string_lossy().to_string();
+            let current_mtime = get_mtime(file_path);
+
+            if let Some(stored_mtime) = meta_store.get_mtime(&path_str) {
+               if stored_mtime == current_mtime {
+                  return None;
+               }
+            }
+
             let content = std::fs::read(file_path).ok()?;
             let hash = compute_hash(&content);
-            let path_str = file_path.to_string_lossy().to_string();
 
             let existing_hash = meta_store
                .get_hash(&path_str)
@@ -91,21 +108,17 @@ where
                .or_else(|| store_hashes.get(&path_str).map(|s| s.as_str()));
             let needs_indexing = existing_hash != Some(hash.as_str());
 
-            Some((path_str, hash, content, needs_indexing))
+            Some((path_str, hash, content, current_mtime, needs_indexing))
          })
          .collect();
 
       let changed_files: Vec<String> = hash_results
          .iter()
-         .filter_map(|result| {
-            if let Some((path, _, _, needs_indexing)) = result {
-               let has_existing_hash =
-                  meta_store.get_hash(path).is_some() || store_hashes.contains_key(path);
-               if *needs_indexing && has_existing_hash {
-                  Some(path.clone())
-               } else {
-                  None
-               }
+         .filter_map(|(path, _, _, _, needs_indexing)| {
+            let has_existing_hash =
+               meta_store.get_hash(path).is_some() || store_hashes.contains_key(path);
+            if *needs_indexing && has_existing_hash {
+               Some(path.clone())
             } else {
                None
             }
@@ -118,8 +131,7 @@ where
 
       let files_to_index: Vec<_> = hash_results
          .into_iter()
-         .flatten()
-         .filter_map(|(path_str, hash, content, needs_indexing)| {
+         .filter_map(|(path_str, hash, content, mtime, needs_indexing)| {
             processed += 1;
             if !needs_indexing {
                skipped += 1;
@@ -128,14 +140,14 @@ where
                indexed += 1;
                None
             } else {
-               Some((path_str, hash, content))
+               Some((path_str, hash, content, mtime))
             }
          })
          .collect();
 
       let chunked_files: Vec<_> = files_to_index
          .par_iter()
-         .filter_map(|(path_str, hash, content)| {
+         .filter_map(|(path_str, hash, content, mtime)| {
             let file_path = Path::new(path_str);
             let content_str = String::from_utf8_lossy(content);
 
@@ -188,17 +200,17 @@ where
                prepared_chunks.push(prepared);
             }
 
-            Some((path_str.clone(), hash.clone(), prepared_chunks))
+            Some((path_str.clone(), hash.clone(), *mtime, prepared_chunks))
          })
          .collect();
 
-      let mut embed_queue: Vec<(String, String, Vec<PreparedChunk>)> = Vec::new();
+      let mut embed_queue: Vec<(String, String, u64, Vec<PreparedChunk>)> = Vec::new();
       let mut since_save = 0;
       let total_to_embed = chunked_files.len();
       let mut embedded = 0;
 
-      for (path_str, hash, prepared_chunks) in chunked_files {
-         embed_queue.push((path_str.clone(), hash, prepared_chunks));
+      for (path_str, hash, mtime, prepared_chunks) in chunked_files {
+         embed_queue.push((path_str.clone(), hash, mtime, prepared_chunks));
 
          if embed_queue.len() >= batch_size {
             if let Some(callback) = &progress_callback {
@@ -287,13 +299,13 @@ where
    async fn process_embed_batch(
       &self,
       store_id: &str,
-      batch: Vec<(String, String, Vec<PreparedChunk>)>,
+      batch: Vec<(String, String, u64, Vec<PreparedChunk>)>,
       meta_store: &mut MetaStore,
    ) -> Result<usize> {
       let mut all_chunks = Vec::new();
       let mut file_paths = Vec::new();
 
-      for (path, _hash, chunks) in &batch {
+      for (path, _hash, _mtime, chunks) in &batch {
          for chunk in chunks {
             all_chunks.push(chunk.clone());
          }
@@ -331,8 +343,8 @@ where
 
       self.store.insert_batch(store_id, records).await?;
 
-      for (path, hash, _) in batch {
-         meta_store.set_hash(path, hash);
+      for (path, hash, mtime, _) in batch {
+         meta_store.set_meta(path, hash, mtime);
       }
 
       Ok(file_paths.len())

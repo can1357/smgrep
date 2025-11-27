@@ -18,6 +18,7 @@ pub enum ChunkType {
 pub struct Chunk {
    pub content:     String,
    pub start_line:  usize,
+   pub start_col:   usize,
    pub end_line:    usize,
    pub chunk_type:  Option<ChunkType>,
    pub context:     Vec<String>,
@@ -36,12 +37,18 @@ impl Chunk {
       Self {
          content,
          start_line,
+         start_col: 0,
          end_line,
          chunk_type: Some(chunk_type),
          context,
          chunk_index: None,
          is_anchor: Some(false),
       }
+   }
+
+   pub fn with_col(mut self, col: usize) -> Self {
+      self.start_col = col;
+      self
    }
 }
 

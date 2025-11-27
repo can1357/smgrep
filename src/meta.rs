@@ -4,8 +4,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Result, config};
 
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct FileMeta {
+   pub hash:  String,
+   pub mtime: u64,
+}
+
 #[derive(Serialize, Deserialize, Default)]
 pub struct MetaStore {
+   #[serde(default)]
+   files:  HashMap<String, FileMeta>,
+   #[serde(default)]
    hashes: HashMap<String, String>,
    #[serde(skip)]
    path:   PathBuf,
@@ -24,7 +33,7 @@ impl MetaStore {
          store.path = path;
          store
       } else {
-         MetaStore { hashes: HashMap::new(), path, dirty: false }
+         MetaStore { files: HashMap::new(), hashes: HashMap::new(), path, dirty: false }
       };
 
       store.dirty = false;
@@ -32,15 +41,35 @@ impl MetaStore {
    }
 
    pub fn get_hash(&self, path: &str) -> Option<&String> {
-      self.hashes.get(path)
+      self.files.get(path).map(|m| &m.hash).or_else(|| self.hashes.get(path))
+   }
+
+   pub fn get_mtime(&self, path: &str) -> Option<u64> {
+      self.files.get(path).map(|m| m.mtime)
+   }
+
+   pub fn get_meta(&self, path: &str) -> Option<&FileMeta> {
+      self.files.get(path)
    }
 
    pub fn set_hash(&mut self, path: String, hash: String) {
-      self.hashes.insert(path, hash);
+      if let Some(meta) = self.files.get_mut(&path) {
+         meta.hash = hash;
+      } else {
+         self.files.insert(path.clone(), FileMeta { hash: hash.clone(), mtime: 0 });
+         self.hashes.remove(&path);
+      }
+      self.dirty = true;
+   }
+
+   pub fn set_meta(&mut self, path: String, hash: String, mtime: u64) {
+      self.files.insert(path.clone(), FileMeta { hash, mtime });
+      self.hashes.remove(&path);
       self.dirty = true;
    }
 
    pub fn remove(&mut self, path: &str) {
+      self.files.remove(path);
       self.hashes.remove(path);
       self.dirty = true;
    }
@@ -57,10 +86,11 @@ impl MetaStore {
    }
 
    pub fn all_paths(&self) -> impl Iterator<Item = &String> {
-      self.hashes.keys()
+      self.files.keys().chain(self.hashes.keys())
    }
 
    pub fn delete_by_prefix(&mut self, prefix: &str) {
+      self.files.retain(|path, _| !path.starts_with(prefix));
       self.hashes.retain(|path, _| !path.starts_with(prefix));
       self.dirty = true;
    }

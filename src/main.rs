@@ -77,18 +77,19 @@ enum Commands {
    },
 
    Serve {
-      #[arg(
-         short = 'p',
-         long,
-         env = "RSGREP_PORT",
-         default_value = "4444",
-         help = "Port to listen on"
-      )]
-      port: u16,
-
       #[arg(long, help = "Directory to serve (default: cwd)")]
       path: Option<PathBuf>,
    },
+
+   Stop {
+      #[arg(long, help = "Directory of server to stop (default: cwd)")]
+      path: Option<PathBuf>,
+   },
+
+   #[command(name = "stop-all")]
+   StopAll,
+
+   Status,
 
    Setup,
 
@@ -96,8 +97,11 @@ enum Commands {
 
    List,
 
-   #[command(name = "install-claude-code")]
-   InstallClaudeCode,
+   #[command(name = "claude-install")]
+   ClaudeInstall,
+
+   #[command(name = "mcp")]
+   Mcp,
 }
 
 #[tokio::main]
@@ -143,11 +147,15 @@ async fn main() -> Result<()> {
       Some(Commands::Index { path, dry_run, reset }) => {
          commands::index::execute(path, dry_run, reset, cli.store).await
       },
-      Some(Commands::Serve { port, path }) => commands::serve::execute(port, path, cli.store).await,
+      Some(Commands::Serve { path }) => commands::serve::execute(path, cli.store).await,
+      Some(Commands::Stop { path }) => commands::stop::execute(path).await,
+      Some(Commands::StopAll) => commands::stop_all::execute().await,
+      Some(Commands::Status) => commands::status::execute().await,
       Some(Commands::Setup) => commands::setup::execute().await,
       Some(Commands::Doctor) => commands::doctor::execute().await,
       Some(Commands::List) => commands::list::execute().await,
-      Some(Commands::InstallClaudeCode) => commands::install_claude::execute().await,
+      Some(Commands::ClaudeInstall) => commands::claude_install::execute().await,
+      Some(Commands::Mcp) => commands::mcp::execute().await,
       None => {
          eprintln!("No command or query provided. Use --help for usage information.");
          std::process::exit(1);

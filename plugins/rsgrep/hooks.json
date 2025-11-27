@@ -1,26 +1,15 @@
 {
-  "hooks": {
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/start.sh",
-            "timeout": 10
-          }
-        ]
-      }
-    ],
-    "SessionEnd": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/stop.sh",
-            "timeout": 10
-          }
-        ]
-      }
-    ]
-  }
+   "hooks": {
+      "SessionStart": [
+         {
+            "hooks": [
+               {
+                  "type": "command",
+                  "command": "echo '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"Prefer mcp__plugin_rsgrep_rsgrep__sem_search over grep/Grep for code search - it finds code by meaning, not just text matching.\"}}'",
+                  "timeout": 10
+               }
+            ]
+         }
+      ]
+   }
 }

@@ -902,11 +902,15 @@ impl super::Store for LanceStore {
          }
 
          let mut full_content = String::new();
+         let mut context_prev_lines = 0u32;
+
          if let Some(prev_col) = batch.column_by_name("context_prev")
             && !prev_col.is_null(row_idx)
             && let Some(prev_str) = prev_col.as_any().downcast_ref::<StringArray>()
          {
-            full_content.push_str(prev_str.value(row_idx));
+            let prev_content = prev_str.value(row_idx);
+            context_prev_lines = prev_content.lines().count() as u32;
+            full_content.push_str(prev_content);
          }
          full_content.push_str(&content);
          if let Some(next_col) = batch.column_by_name("context_next")
@@ -916,11 +920,13 @@ impl super::Store for LanceStore {
             full_content.push_str(next_str.value(row_idx));
          }
 
+         let adjusted_start_line = start_line.saturating_sub(context_prev_lines);
+
          scored_results.push(SearchResult {
             path,
             content: full_content,
             score,
-            start_line,
+            start_line: adjusted_start_line,
             num_lines: end_line.saturating_sub(start_line).max(1),
             chunk_type,
             is_anchor,

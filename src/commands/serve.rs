@@ -4,265 +4,77 @@ use std::{
       Arc,
       atomic::{AtomicBool, AtomicU8, Ordering},
    },
+   time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
-use axum::{
-   Json, Router,
-   extract::State,
-   http::{HeaderMap, StatusCode},
-   response::{IntoResponse, Response},
-   routing::{get, post},
-};
 use console::style;
-use serde::{Deserialize, Serialize};
+use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
-use tokio::signal;
-use tower_http::cors::CorsLayer;
-use uuid::Uuid;
+use tokio::{
+   net::{UnixListener, UnixStream},
+   signal,
+   sync::watch,
+};
 
 use crate::{
    chunker,
    embed::Embedder,
    file::{FileSystem, FileWatcher, LocalFileSystem, WatchAction},
+   ipc::{self, Request, Response, ServerStatus},
    meta::MetaStore,
    store::Store,
-   types::{PreparedChunk, VectorRecord},
+   types::{PreparedChunk, SearchResponse, SearchStatus, VectorRecord},
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServerLock {
-   pub port:       u16,
-   pub pid:        u32,
-   pub auth_token: String,
-}
+const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
-fn server_lock_path(root: &Path) -> PathBuf {
-   root.join(".rsgrep").join("server.json")
-}
-
-pub fn read_server_lock(root: &Path) -> Result<Option<ServerLock>> {
-   let lock_path = server_lock_path(root);
-   if !lock_path.exists() {
-      return Ok(None);
-   }
-
-   let content = std::fs::read_to_string(&lock_path).context("failed to read server lock file")?;
-   let lock: ServerLock =
-      serde_json::from_str(&content).context("failed to parse server lock file")?;
-
-   Ok(Some(lock))
-}
-
-pub fn write_server_lock(root: &Path, lock: &ServerLock) -> Result<()> {
-   let lock_path = server_lock_path(root);
-   if let Some(parent) = lock_path.parent() {
-      std::fs::create_dir_all(parent).context("failed to create .rsgrep directory")?;
-   }
-
-   let content = serde_json::to_string_pretty(lock).context("failed to serialize server lock")?;
-   std::fs::write(&lock_path, content).context("failed to write server lock file")?;
-
-   Ok(())
-}
-
-pub fn remove_server_lock(root: &Path) -> Result<()> {
-   let lock_path = server_lock_path(root);
-   if lock_path.exists() {
-      std::fs::remove_file(&lock_path).context("failed to remove server lock file")?;
-   }
-   Ok(())
-}
-
-#[derive(Clone)]
 struct ServerState {
-   store:      Arc<dyn Store>,
-   embedder:   Arc<dyn Embedder>,
-   store_id:   String,
-   auth_token: String,
-   root:       PathBuf,
-   indexing:   Arc<AtomicBool>,
-   progress:   Arc<AtomicU8>,
+   store:         Arc<dyn Store>,
+   embedder:      Arc<dyn Embedder>,
+   store_id:      String,
+   root:          PathBuf,
+   indexing:      Arc<AtomicBool>,
+   progress:      Arc<AtomicU8>,
+   last_activity: Arc<Mutex<Instant>>,
 }
 
-#[derive(Debug, Deserialize)]
-struct SearchRequest {
-   query:  String,
-   #[serde(default)]
-   limit:  Option<usize>,
-   #[serde(default)]
-   path:   Option<String>,
-   #[serde(default = "default_rerank")]
-   rerank: bool,
-}
-
-fn default_rerank() -> bool {
-   true
-}
-
-#[derive(Debug, Serialize)]
-struct SearchResponseJson {
-   results:  Vec<JsonResult>,
-   status:   String,
-   #[serde(skip_serializing_if = "Option::is_none")]
-   progress: Option<u8>,
-}
-
-#[derive(Debug, Serialize)]
-struct JsonResult {
-   path:       String,
-   score:      f32,
-   content:    String,
-   #[serde(skip_serializing_if = "Option::is_none")]
-   chunk_type: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct HealthResponse {
-   status: String,
-}
-
-async fn health_handler() -> Json<HealthResponse> {
-   Json(HealthResponse { status: "ready".to_string() })
-}
-
-async fn search_handler(
-   State(state): State<ServerState>,
-   headers: HeaderMap,
-   Json(req): Json<SearchRequest>,
-) -> Result<Json<SearchResponseJson>, ApiError> {
-   let auth_header = headers
-      .get("authorization")
-      .and_then(|v| v.to_str().ok())
-      .unwrap_or("");
-
-   let provided_token = auth_header.strip_prefix("Bearer ").unwrap_or(auth_header);
-
-   if provided_token != state.auth_token {
-      return Err(ApiError::Unauthorized);
+impl ServerState {
+   fn touch(&self) {
+      *self.last_activity.lock() = Instant::now();
    }
 
-   if req.query.is_empty() {
-      return Err(ApiError::BadRequest("query is required".to_string()));
-   }
-
-   let limit = req.limit.unwrap_or(25);
-   let search_path = req.path.as_ref().map(|p| {
-      if Path::new(p).is_absolute() {
-         PathBuf::from(p)
-      } else {
-         state.root.join(p)
-      }
-   });
-
-   let query_emb = state
-      .embedder
-      .encode_query(&req.query)
-      .await
-      .map_err(|e| ApiError::Internal(format!("embedding failed: {}", e)))?;
-
-   let path_filter = search_path
-      .as_ref()
-      .map(|p| p.to_string_lossy().to_string());
-
-   let response = state
-      .store
-      .search(
-         &state.store_id,
-         &req.query,
-         &query_emb.dense,
-         &query_emb.colbert,
-         limit,
-         path_filter.as_deref(),
-         req.rerank,
-      )
-      .await
-      .map_err(|e| ApiError::Internal(format!("search failed: {}", e)))?;
-
-   let results: Vec<JsonResult> = response
-      .results
-      .into_iter()
-      .map(|r| {
-         let rel_path = r
-            .path
-            .strip_prefix(&state.root.to_string_lossy().to_string())
-            .unwrap_or(&r.path)
-            .trim_start_matches('/')
-            .to_string();
-
-         JsonResult {
-            path:       rel_path,
-            score:      r.score,
-            content:    format_dense_snippet(&r.content),
-            chunk_type: Some(format!("{:?}", r.chunk_type).to_lowercase()),
-         }
-      })
-      .collect();
-
-   let is_indexing = state.indexing.load(Ordering::Relaxed);
-   let progress_val = state.progress.load(Ordering::Relaxed);
-
-   Ok(Json(SearchResponseJson {
-      results,
-      status: if is_indexing { "indexing" } else { "ready" }.to_string(),
-      progress: if is_indexing {
-         Some(progress_val)
-      } else {
-         None
-      },
-   }))
-}
-
-fn format_dense_snippet(content: &str) -> String {
-   let lines: Vec<&str> = content.lines().take(5).collect();
-   if lines.len() < content.lines().count() {
-      format!("{}\n...", lines.join("\n"))
-   } else {
-      lines.join("\n")
+   fn idle_duration(&self) -> Duration {
+      self.last_activity.lock().elapsed()
    }
 }
 
-#[derive(Debug)]
-enum ApiError {
-   Unauthorized,
-   BadRequest(String),
-   Internal(String),
-}
-
-impl IntoResponse for ApiError {
-   fn into_response(self) -> Response {
-      let (status, message) = match self {
-         ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".to_string()),
-         ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
-         ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
-      };
-
-      let body = serde_json::json!({ "error": message });
-      (status, Json(body)).into_response()
-   }
-}
-
-pub async fn execute(port: u16, path: Option<PathBuf>, store_id: Option<String>) -> Result<()> {
+pub async fn execute(path: Option<PathBuf>, store_id: Option<String>) -> Result<()> {
    let root = std::env::current_dir()?;
    let serve_path = path.unwrap_or_else(|| root.clone());
 
-   let resolved_store_id = store_id.unwrap_or_else(|| {
-      serve_path
-         .file_name()
-         .and_then(|s| s.to_str())
-         .unwrap_or("default")
-         .to_string()
-   });
+   let resolved_store_id = store_id
+      .map(Ok)
+      .unwrap_or_else(|| crate::git::resolve_store_id(&serve_path))?;
 
-   let auth_token = Uuid::new_v4().to_string();
-   let pid = std::process::id();
+   let socket_path = ipc::socket_path(&resolved_store_id);
+   if let Some(parent) = socket_path.parent() {
+      std::fs::create_dir_all(parent).context("failed to create socks directory")?;
+   }
 
-   let lock = ServerLock { port, pid, auth_token: auth_token.clone() };
+   if socket_path.exists() {
+      if try_connect(&socket_path).await {
+         println!("{}", style("Server already running").yellow());
+         return Ok(());
+      }
+      std::fs::remove_file(&socket_path).context("failed to remove stale socket")?;
+   }
 
-   write_server_lock(&serve_path, &lock)?;
+   let listener = UnixListener::bind(&socket_path).context("failed to bind socket")?;
 
    println!("{}", style("Starting rsgrep server...").green().bold());
-   println!("Port: {}", style(port.to_string()).cyan());
+   println!("Socket: {}", style(socket_path.display()).cyan());
    println!("Path: {}", style(serve_path.display()).dim());
    println!("Store ID: {}", style(&resolved_store_id).cyan());
 
@@ -271,7 +83,7 @@ pub async fn execute(port: u16, path: Option<PathBuf>, store_id: Option<String>)
 
    if !embedder.is_ready() {
       println!("{}", style("Waiting for embedder to initialize...").yellow());
-      tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+      tokio::time::sleep(Duration::from_millis(500)).await;
    }
 
    let meta_store = MetaStore::load(&resolved_store_id)?;
@@ -280,6 +92,7 @@ pub async fn execute(port: u16, path: Option<PathBuf>, store_id: Option<String>)
    let indexing = Arc::new(AtomicBool::new(false));
    let progress = Arc::new(AtomicU8::new(0));
    let meta_store_arc = Arc::new(parking_lot::Mutex::new(meta_store));
+   let last_activity = Arc::new(Mutex::new(Instant::now()));
 
    if is_empty {
       println!("{}", style("Store empty, performing initial index...").yellow());
@@ -310,15 +123,15 @@ pub async fn execute(port: u16, path: Option<PathBuf>, store_id: Option<String>)
       });
    }
 
-   let state = ServerState {
-      store:      Arc::clone(&store),
-      embedder:   Arc::clone(&embedder),
-      store_id:   resolved_store_id.clone(),
-      auth_token: auth_token.clone(),
-      root:       serve_path.clone(),
-      indexing:   Arc::clone(&indexing),
-      progress:   Arc::clone(&progress),
-   };
+   let state = Arc::new(ServerState {
+      store: Arc::clone(&store),
+      embedder: Arc::clone(&embedder),
+      store_id: resolved_store_id.clone(),
+      root: serve_path.clone(),
+      indexing: Arc::clone(&indexing),
+      progress: Arc::clone(&progress),
+      last_activity,
+   });
 
    let _watcher = start_watcher(
       serve_path.clone(),
@@ -328,34 +141,206 @@ pub async fn execute(port: u16, path: Option<PathBuf>, store_id: Option<String>)
       Arc::clone(&meta_store_arc),
    )?;
 
-   let app = Router::new()
-      .route("/health", get(health_handler))
-      .route("/search", post(search_handler))
-      .layer(CorsLayer::permissive())
-      .with_state(state);
+   let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-   let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-      .await
-      .context("failed to bind to port")?;
+   let idle_state = Arc::clone(&state);
+   let idle_shutdown = shutdown_tx.clone();
+   tokio::spawn(async move {
+      loop {
+         tokio::time::sleep(IDLE_CHECK_INTERVAL).await;
+         if idle_state.idle_duration() > IDLE_TIMEOUT {
+            println!("{}", style("Idle timeout reached, shutting down...").yellow());
+            let _ = idle_shutdown.send(true);
+            break;
+         }
+      }
+   });
 
-   println!("\n{}", style(format!("Server listening on http://127.0.0.1:{}", port)).green());
+   println!("\n{}", style("Server listening").green());
    println!("{}", style("Press Ctrl+C to stop").dim());
 
-   let server = axum::serve(listener, app);
+   let accept_state = Arc::clone(&state);
+   let mut accept_shutdown = shutdown_rx.clone();
+   let accept_handle = tokio::spawn(async move {
+      loop {
+         tokio::select! {
+            result = listener.accept() => {
+               match result {
+                  Ok((stream, _)) => {
+                     let client_state = Arc::clone(&accept_state);
+                     tokio::spawn(handle_client(stream, client_state));
+                  }
+                  Err(e) => {
+                     tracing::error!("Accept error: {}", e);
+                  }
+               }
+            }
+            _ = accept_shutdown.changed() => {
+               if *accept_shutdown.borrow() {
+                  break;
+               }
+            }
+         }
+      }
+   });
 
    tokio::select! {
-      result = server => {
-         result.context("server error")?;
-      }
       _ = signal::ctrl_c() => {
          println!("\n{}", style("Shutting down...").yellow());
+         let _ = shutdown_tx.send(true);
       }
+      _ = async {
+         let mut rx = shutdown_rx.clone();
+         loop {
+            rx.changed().await.ok();
+            if *rx.borrow() {
+               break;
+            }
+         }
+      } => {}
    }
 
-   remove_server_lock(&serve_path)?;
-   println!("{}", style("Server stopped").green());
+   accept_handle.abort();
+   let _ = std::fs::remove_file(&socket_path);
 
+   println!("{}", style("Server stopped").green());
    Ok(())
+}
+
+async fn try_connect(socket_path: &Path) -> bool {
+   UnixStream::connect(socket_path).await.is_ok()
+}
+
+async fn handle_client(mut stream: UnixStream, state: Arc<ServerState>) {
+   state.touch();
+
+   let mut buffer = ipc::SocketBuffer::new();
+
+   loop {
+      let request: Request = match buffer.recv(&mut stream).await {
+         Ok(req) => req,
+         Err(e) => {
+            if e.to_string().contains("failed to read length") {
+               break;
+            }
+            tracing::debug!("Client read error: {}", e);
+            break;
+         },
+      };
+
+      state.touch();
+
+      let response = match request {
+         Request::Search { query, limit, path, rerank } => {
+            handle_search(&state, query, limit, path, rerank).await
+         },
+         Request::Health => Response::Health {
+            status: ServerStatus {
+               indexing: state.indexing.load(Ordering::Relaxed),
+               progress: state.progress.load(Ordering::Relaxed),
+               files:    0,
+            },
+         },
+         Request::Shutdown => {
+            let _ = buffer
+               .send(&mut stream, &Response::Shutdown { success: true })
+               .await;
+            std::process::exit(0);
+         },
+      };
+
+      if let Err(e) = buffer.send(&mut stream, &response).await {
+         tracing::debug!("Client write error: {}", e);
+         break;
+      }
+   }
+}
+
+async fn handle_search(
+   state: &ServerState,
+   query: String,
+   limit: usize,
+   path: Option<String>,
+   rerank: bool,
+) -> Response {
+   if query.is_empty() {
+      return Response::Error { message: "query is required".to_string() };
+   }
+
+   let search_path = path.as_ref().map(|p| {
+      if Path::new(p).is_absolute() {
+         PathBuf::from(p)
+      } else {
+         state.root.join(p)
+      }
+   });
+
+   let query_emb = match state.embedder.encode_query(&query).await {
+      Ok(emb) => emb,
+      Err(e) => return Response::Error { message: format!("embedding failed: {}", e) },
+   };
+
+   let path_filter = search_path
+      .as_ref()
+      .map(|p| p.to_string_lossy().to_string());
+
+   let search_result = state
+      .store
+      .search(
+         &state.store_id,
+         &query,
+         &query_emb.dense,
+         &query_emb.colbert,
+         limit,
+         path_filter.as_deref(),
+         rerank,
+      )
+      .await;
+
+   match search_result {
+      Ok(response) => {
+         let results = response
+            .results
+            .into_iter()
+            .map(|r| {
+               let rel_path = r
+                  .path
+                  .strip_prefix(&state.root.to_string_lossy().to_string())
+                  .unwrap_or(&r.path)
+                  .trim_start_matches('/')
+                  .to_string();
+
+               crate::types::SearchResult {
+                  path:       rel_path,
+                  content:    r.content,
+                  score:      r.score,
+                  start_line: r.start_line,
+                  num_lines:  r.num_lines,
+                  chunk_type: r.chunk_type,
+                  is_anchor:  r.is_anchor,
+               }
+            })
+            .collect();
+
+         let is_indexing = state.indexing.load(Ordering::Relaxed);
+         let progress_val = state.progress.load(Ordering::Relaxed);
+
+         Response::Search(SearchResponse {
+            results,
+            status: if is_indexing {
+               SearchStatus::Indexing
+            } else {
+               SearchStatus::Ready
+            },
+            progress: if is_indexing {
+               Some(progress_val)
+            } else {
+               None
+            },
+         })
+      },
+      Err(e) => Response::Error { message: format!("search failed: {}", e) },
+   }
 }
 
 async fn initial_sync(
