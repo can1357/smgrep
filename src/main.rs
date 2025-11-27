@@ -4,10 +4,27 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use smgrep::commands;
 
+fn version_string() -> &'static str {
+   const VERSION: &str = env!("CARGO_PKG_VERSION");
+   const GIT_HASH: &str = env!("GIT_HASH");
+   const GIT_TAG: &str = env!("GIT_TAG");
+   const GIT_DIRTY: &str = env!("GIT_DIRTY");
+
+   static VERSION_STRING: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+   VERSION_STRING.get_or_init(|| {
+      let dirty = if GIT_DIRTY == "true" { "-dirty" } else { "" };
+      if GIT_TAG.is_empty() {
+         format!("{VERSION} ({GIT_HASH}{dirty})")
+      } else {
+         format!("{VERSION} ({GIT_TAG}, {GIT_HASH}{dirty})")
+      }
+   })
+}
+
 #[derive(Parser)]
 #[command(name = "smgrep")]
 #[command(about = "Semantic code search tool - Rust port of osgrep")]
-#[command(version)]
+#[command(version = version_string())]
 struct Cli {
    #[arg(long, env = "SMGREP_STORE")]
    store: Option<String>,
