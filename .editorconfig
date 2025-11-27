@@ -1,0 +1,24 @@
+root = true
+
+[*]
+indent_style = space
+indent_size = 3
+end_of_line = lf
+charset = utf-8
+trim_trailing_whitespace = true
+insert_final_newline = true
+
+[*.rs]
+max_line_length = 100
+indent_size = 3
+
+[*.md]
+indent_size = 2
+
+[*.tla]
+indent_size = 2
+indent_style = space
+
+[*.cfg]
+indent_size = 2
+indent_style = space

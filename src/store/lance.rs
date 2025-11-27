@@ -1,0 +1,1172 @@
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
+
+use arrow_array::{
+   Array, BooleanArray, FixedSizeListArray, Float32Array, Float64Array, LargeBinaryArray,
+   LargeStringArray, RecordBatch, RecordBatchReader, StringArray, UInt32Array,
+   builder::{
+      BooleanBuilder, Float32Builder, Float64Builder, LargeBinaryBuilder, LargeStringBuilder,
+      StringBuilder, UInt32Builder,
+   },
+};
+use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
+use futures::TryStreamExt;
+use lancedb::{
+   Connection, Table, connect,
+   index::scalar::FullTextSearchQuery,
+   query::{ExecutableQuery, QueryBase},
+};
+use parking_lot::RwLock;
+
+use crate::{
+   config::{COLBERT_DIM, DENSE_DIM},
+   error::{Result, RsgrepError},
+   types::{ChunkType, SearchResponse, SearchResult, SearchStatus, StoreInfo, VectorRecord},
+};
+
+pub enum RecordBatchOnce {
+   Batch(RecordBatch),
+   Taken(SchemaRef),
+   __Invalid,
+}
+
+impl RecordBatchOnce {
+   pub fn new(batch: RecordBatch) -> Self {
+      Self::Batch(batch)
+   }
+
+   pub fn take(&mut self) -> Result<RecordBatch, SchemaRef> {
+      let prev = std::mem::replace(self, Self::__Invalid);
+      match prev {
+         Self::Batch(batch) => {
+            *self = Self::Taken(batch.schema().clone());
+            Ok(batch)
+         },
+         Self::Taken(schema) => {
+            *self = Self::Taken(schema.clone());
+            Err(schema)
+         },
+         Self::__Invalid => {
+            unreachable!()
+         },
+      }
+   }
+}
+
+impl Iterator for RecordBatchOnce {
+   type Item = Result<RecordBatch, ArrowError>;
+
+   fn next(&mut self) -> Option<Self::Item> {
+      self.take().ok().map(Ok)
+   }
+}
+
+impl RecordBatchReader for RecordBatchOnce {
+   fn schema(&self) -> arrow_schema::SchemaRef {
+      match self {
+         Self::Batch(batch) => batch.schema().clone(),
+         Self::Taken(schema) => schema.clone(),
+         Self::__Invalid => unreachable!(),
+      }
+   }
+}
+
+pub struct LanceStore {
+   connections: RwLock<HashMap<String, Arc<Connection>>>,
+   data_dir:    PathBuf,
+}
+
+impl LanceStore {
+   pub fn new() -> Result<Self> {
+      let data_dir = crate::config::data_dir().join("data");
+      std::fs::create_dir_all(&data_dir)?;
+
+      Ok(Self { connections: RwLock::new(HashMap::new()), data_dir })
+   }
+
+   async fn get_connection(&self, store_id: &str) -> Result<Arc<Connection>> {
+      {
+         let connections = self.connections.read();
+         if let Some(conn) = connections.get(store_id) {
+            return Ok(Arc::clone(conn));
+         }
+      }
+
+      let db_path = self.data_dir.join(store_id);
+      std::fs::create_dir_all(&db_path)?;
+
+      let conn = connect(
+         db_path
+            .to_str()
+            .ok_or_else(|| RsgrepError::Store("invalid database path".to_string()))?,
+      )
+      .execute()
+      .await
+      .map_err(|e| RsgrepError::Store(format!("failed to connect to database: {}", e)))?;
+
+      let conn = Arc::new(conn);
+      self
+         .connections
+         .write()
+         .insert(store_id.to_string(), Arc::clone(&conn));
+
+      Ok(conn)
+   }
+
+   async fn get_table(&self, store_id: &str) -> Result<Table> {
+      let conn = self.get_connection(store_id).await?;
+
+      match conn.open_table(store_id).execute().await {
+         Ok(table) => {
+            Self::check_and_migrate_table(&conn, store_id, &table).await?;
+            conn.open_table(store_id).execute().await.map_err(|e| {
+               RsgrepError::Store(format!("failed to reopen table after migration: {}", e))
+            })
+         },
+         Err(_) => {
+            let schema = Self::create_schema();
+            let empty_batch = Self::create_empty_batch(&schema)?;
+
+            conn
+               .create_table(store_id, RecordBatchOnce::new(empty_batch))
+               .execute()
+               .await
+               .map_err(|e| RsgrepError::Store(format!("failed to create table: {}", e)))
+         },
+      }
+   }
+
+   async fn check_and_migrate_table(
+      conn: &Connection,
+      store_id: &str,
+      table: &Table,
+   ) -> Result<()> {
+      let mut stream = table.query().limit(1).execute().await.map_err(|e| {
+         RsgrepError::Store(format!("failed to sample table for migration check: {}", e))
+      })?;
+
+      let sample_batch = match stream.try_next().await {
+         Ok(Some(batch)) => batch,
+         Ok(None) => return Ok(()),
+         Err(e) => return Err(RsgrepError::Store(format!("failed to read sample batch: {}", e))),
+      };
+
+      let vector_col = match sample_batch.column_by_name("vector") {
+         Some(col) => col,
+         None => return Ok(()),
+      };
+
+      let vector_list = match vector_col.as_any().downcast_ref::<FixedSizeListArray>() {
+         Some(arr) => arr,
+         None => return Ok(()),
+      };
+
+      let sample_vector_len = vector_list.value_length() as usize;
+
+      if sample_vector_len == DENSE_DIM {
+         return Ok(());
+      }
+
+      let mut all_stream = table.query().execute().await.map_err(|e| {
+         RsgrepError::Store(format!("failed to read existing data for migration: {}", e))
+      })?;
+
+      let mut existing_batches: Vec<RecordBatch> = Vec::new();
+      while let Some(batch) = all_stream
+         .try_next()
+         .await
+         .map_err(|e| RsgrepError::Store(format!("failed to collect existing batches: {}", e)))?
+      {
+         existing_batches.push(batch);
+      }
+
+      conn.drop_table(store_id, &[]).await.map_err(|e| {
+         RsgrepError::Store(format!("failed to drop old table during migration: {}", e))
+      })?;
+
+      let schema = Self::create_schema();
+      let empty_batch = Self::create_empty_batch(&schema)?;
+
+      let new_table = conn
+         .create_table(store_id, RecordBatchOnce::new(empty_batch))
+         .execute()
+         .await
+         .map_err(|e| {
+            RsgrepError::Store(format!("failed to create new table during migration: {}", e))
+         })?;
+
+      if !existing_batches.is_empty() {
+         let mut migrated_records = Vec::new();
+
+         for batch in existing_batches {
+            for row_idx in 0..batch.num_rows() {
+               let id = batch
+                  .column_by_name("id")
+                  .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+                  .map(|arr| arr.value(row_idx).to_string())
+                  .unwrap_or_default();
+
+               let path = batch
+                  .column_by_name("path")
+                  .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+                  .map(|arr| arr.value(row_idx).to_string())
+                  .unwrap_or_default();
+
+               let hash = batch
+                  .column_by_name("hash")
+                  .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+                  .map(|arr| arr.value(row_idx).to_string())
+                  .unwrap_or_default();
+
+               let content = batch
+                  .column_by_name("content")
+                  .and_then(|col| {
+                     col.as_any()
+                        .downcast_ref::<LargeStringArray>()
+                        .map(|arr| arr.value(row_idx).to_string())
+                        .or_else(|| {
+                           col.as_any()
+                              .downcast_ref::<StringArray>()
+                              .map(|arr| arr.value(row_idx).to_string())
+                        })
+                  })
+                  .unwrap_or_default();
+
+               let start_line = batch
+                  .column_by_name("start_line")
+                  .and_then(|col| col.as_any().downcast_ref::<UInt32Array>())
+                  .map(|arr| arr.value(row_idx))
+                  .unwrap_or(0);
+
+               let end_line = batch
+                  .column_by_name("end_line")
+                  .and_then(|col| col.as_any().downcast_ref::<UInt32Array>())
+                  .map(|arr| arr.value(row_idx))
+                  .unwrap_or(start_line);
+
+               let old_vector_col = batch.column_by_name("vector").unwrap();
+               let old_vector_list = old_vector_col
+                  .as_any()
+                  .downcast_ref::<FixedSizeListArray>()
+                  .unwrap();
+               let old_vector_values = old_vector_list.value(row_idx);
+               let old_vector_floats = old_vector_values
+                  .as_any()
+                  .downcast_ref::<Float32Array>()
+                  .unwrap();
+
+               let old_vec: Vec<f32> = (0..old_vector_floats.len())
+                  .map(|i| old_vector_floats.value(i))
+                  .collect();
+
+               let new_vector = Self::normalize_vector(&old_vec);
+
+               let colbert = batch
+                  .column_by_name("colbert")
+                  .and_then(|col| {
+                     if col.is_null(row_idx) {
+                        None
+                     } else {
+                        col.as_any()
+                           .downcast_ref::<LargeBinaryArray>()
+                           .map(|arr| arr.value(row_idx).to_vec())
+                     }
+                  })
+                  .unwrap_or_default();
+
+               let colbert_scale = batch
+                  .column_by_name("colbert_scale")
+                  .and_then(|col| {
+                     if col.is_null(row_idx) {
+                        None
+                     } else {
+                        col.as_any()
+                           .downcast_ref::<Float64Array>()
+                           .map(|arr| arr.value(row_idx))
+                     }
+                  })
+                  .unwrap_or(1.0);
+
+               let chunk_index = batch.column_by_name("chunk_index").and_then(|col| {
+                  if col.is_null(row_idx) {
+                     None
+                  } else {
+                     col.as_any()
+                        .downcast_ref::<UInt32Array>()
+                        .map(|arr| arr.value(row_idx))
+                  }
+               });
+
+               let is_anchor = batch
+                  .column_by_name("is_anchor")
+                  .and_then(|col| {
+                     if col.is_null(row_idx) {
+                        None
+                     } else {
+                        col.as_any()
+                           .downcast_ref::<BooleanArray>()
+                           .map(|arr| arr.value(row_idx))
+                     }
+                  });
+
+               let chunk_type = batch
+                  .column_by_name("chunk_type")
+                  .and_then(|col| {
+                     if col.is_null(row_idx) {
+                        None
+                     } else {
+                        col.as_any()
+                           .downcast_ref::<StringArray>()
+                           .map(|arr| Self::parse_chunk_type(arr.value(row_idx)))
+                     }
+                  });
+
+               let context_prev = batch.column_by_name("context_prev").and_then(|col| {
+                  if col.is_null(row_idx) {
+                     None
+                  } else {
+                     col.as_any()
+                        .downcast_ref::<StringArray>()
+                        .map(|arr| arr.value(row_idx).to_string())
+                  }
+               });
+
+               let context_next = batch.column_by_name("context_next").and_then(|col| {
+                  if col.is_null(row_idx) {
+                     None
+                  } else {
+                     col.as_any()
+                        .downcast_ref::<StringArray>()
+                        .map(|arr| arr.value(row_idx).to_string())
+                  }
+               });
+
+               migrated_records.push(VectorRecord {
+                  id,
+                  path,
+                  hash,
+                  content,
+                  start_line,
+                  end_line,
+                  vector: new_vector,
+                  colbert,
+                  colbert_scale,
+                  chunk_index,
+                  is_anchor,
+                  chunk_type,
+                  context_prev,
+                  context_next,
+               });
+            }
+         }
+
+         if !migrated_records.is_empty() {
+            let migrated_batch = Self::records_to_batch(migrated_records)?;
+            new_table
+               .add(RecordBatchOnce::new(migrated_batch))
+               .execute()
+               .await
+               .map_err(|e| RsgrepError::Store(format!("failed to add migrated records: {}", e)))?;
+         }
+      }
+
+      Ok(())
+   }
+
+   fn normalize_vector(old_vector: &[f32]) -> Vec<f32> {
+      let mut new_vector = vec![0.0; DENSE_DIM];
+      let copy_len = old_vector.len().min(DENSE_DIM);
+      new_vector[..copy_len].copy_from_slice(&old_vector[..copy_len]);
+      new_vector
+   }
+
+   fn create_schema() -> Arc<Schema> {
+      Arc::new(Schema::new(vec![
+         Field::new("id", DataType::Utf8, false),
+         Field::new("path", DataType::Utf8, false),
+         Field::new("hash", DataType::Utf8, false),
+         Field::new("content", DataType::LargeUtf8, false),
+         Field::new("start_line", DataType::UInt32, false),
+         Field::new("end_line", DataType::UInt32, false),
+         Field::new(
+            "vector",
+            DataType::FixedSizeList(
+               Arc::new(Field::new("item", DataType::Float32, true)),
+               DENSE_DIM as i32,
+            ),
+            false,
+         ),
+         Field::new("colbert", DataType::LargeBinary, true),
+         Field::new("colbert_scale", DataType::Float64, true),
+         Field::new("chunk_index", DataType::UInt32, true),
+         Field::new("is_anchor", DataType::Boolean, true),
+         Field::new("chunk_type", DataType::Utf8, true),
+         Field::new("context_prev", DataType::Utf8, true),
+         Field::new("context_next", DataType::Utf8, true),
+      ]))
+   }
+
+   fn create_empty_batch(schema: &Arc<Schema>) -> Result<RecordBatch> {
+      let id_array = StringBuilder::new().finish();
+      let path_array = StringBuilder::new().finish();
+      let hash_array = StringBuilder::new().finish();
+      let content_array = LargeStringBuilder::new().finish();
+      let start_line_array = UInt32Builder::new().finish();
+      let end_line_array = UInt32Builder::new().finish();
+
+      let vector_values = Float32Builder::new().finish();
+      let vector_array = FixedSizeListArray::new(
+         Arc::new(Field::new("item", DataType::Float32, true)),
+         DENSE_DIM as i32,
+         Arc::new(vector_values),
+         None,
+      );
+
+      let colbert_array = LargeBinaryBuilder::new().finish();
+      let colbert_scale_array = Float64Builder::new().finish();
+      let chunk_index_array = UInt32Builder::new().finish();
+      let is_anchor_array = BooleanBuilder::new().finish();
+      let chunk_type_array = StringBuilder::new().finish();
+      let context_prev_array = StringBuilder::new().finish();
+      let context_next_array = StringBuilder::new().finish();
+
+      RecordBatch::try_new(schema.clone(), vec![
+         Arc::new(id_array),
+         Arc::new(path_array),
+         Arc::new(hash_array),
+         Arc::new(content_array),
+         Arc::new(start_line_array),
+         Arc::new(end_line_array),
+         Arc::new(vector_array),
+         Arc::new(colbert_array),
+         Arc::new(colbert_scale_array),
+         Arc::new(chunk_index_array),
+         Arc::new(is_anchor_array),
+         Arc::new(chunk_type_array),
+         Arc::new(context_prev_array),
+         Arc::new(context_next_array),
+      ])
+      .map_err(|e| RsgrepError::Store(format!("failed to create empty batch: {}", e)))
+   }
+
+   fn records_to_batch(records: Vec<VectorRecord>) -> Result<RecordBatch> {
+      if records.is_empty() {
+         return Err(RsgrepError::Store("empty batch".to_string()));
+      }
+
+      let schema = Self::create_schema();
+      let _len = records.len();
+
+      let mut id_builder = StringBuilder::new();
+      let mut path_builder = StringBuilder::new();
+      let mut hash_builder = StringBuilder::new();
+      let mut content_builder = LargeStringBuilder::new();
+      let mut start_line_builder = UInt32Builder::new();
+      let mut end_line_builder = UInt32Builder::new();
+      let mut vector_builder = Float32Builder::new();
+      let mut colbert_builder = LargeBinaryBuilder::new();
+      let mut colbert_scale_builder = Float64Builder::new();
+      let mut chunk_index_builder = UInt32Builder::new();
+      let mut is_anchor_builder = BooleanBuilder::new();
+      let mut chunk_type_builder = StringBuilder::new();
+      let mut context_prev_builder = StringBuilder::new();
+      let mut context_next_builder = StringBuilder::new();
+
+      for record in records {
+         id_builder.append_value(&record.id);
+         path_builder.append_value(&record.path);
+         hash_builder.append_value(&record.hash);
+         content_builder.append_value(&record.content);
+         start_line_builder.append_value(record.start_line);
+         end_line_builder.append_value(record.end_line);
+
+         if record.vector.len() != DENSE_DIM {
+            return Err(RsgrepError::Store(format!(
+               "vector dimension mismatch: expected {}, got {}",
+               DENSE_DIM,
+               record.vector.len()
+            )));
+         }
+
+         for &val in &record.vector {
+            vector_builder.append_value(val);
+         }
+
+         colbert_builder.append_value(&record.colbert);
+         colbert_scale_builder.append_value(record.colbert_scale);
+
+         if let Some(idx) = record.chunk_index {
+            chunk_index_builder.append_value(idx);
+         } else {
+            chunk_index_builder.append_null();
+         }
+
+         if let Some(is_anchor) = record.is_anchor {
+            is_anchor_builder.append_value(is_anchor);
+         } else {
+            is_anchor_builder.append_null();
+         }
+
+         if let Some(chunk_type) = record.chunk_type {
+            let chunk_type_str = match chunk_type {
+               ChunkType::Function => "function",
+               ChunkType::Class => "class",
+               ChunkType::Interface => "interface",
+               ChunkType::Method => "method",
+               ChunkType::TypeAlias => "type_alias",
+               ChunkType::Block => "block",
+               ChunkType::Other => "other",
+            };
+            chunk_type_builder.append_value(chunk_type_str);
+         } else {
+            chunk_type_builder.append_null();
+         }
+
+         if let Some(prev) = &record.context_prev {
+            context_prev_builder.append_value(prev);
+         } else {
+            context_prev_builder.append_null();
+         }
+
+         if let Some(next) = &record.context_next {
+            context_next_builder.append_value(next);
+         } else {
+            context_next_builder.append_null();
+         }
+      }
+
+      let id_array = id_builder.finish();
+      let path_array = path_builder.finish();
+      let hash_array = hash_builder.finish();
+      let content_array = content_builder.finish();
+      let start_line_array = start_line_builder.finish();
+      let end_line_array = end_line_builder.finish();
+
+      let vector_values_array = vector_builder.finish();
+      let vector_array = FixedSizeListArray::new(
+         Arc::new(Field::new("item", DataType::Float32, true)),
+         DENSE_DIM as i32,
+         Arc::new(vector_values_array),
+         None,
+      );
+
+      let colbert_array = colbert_builder.finish();
+      let colbert_scale_array = colbert_scale_builder.finish();
+      let chunk_index_array = chunk_index_builder.finish();
+      let is_anchor_array = is_anchor_builder.finish();
+      let chunk_type_array = chunk_type_builder.finish();
+      let context_prev_array = context_prev_builder.finish();
+      let context_next_array = context_next_builder.finish();
+
+      RecordBatch::try_new(schema, vec![
+         Arc::new(id_array),
+         Arc::new(path_array),
+         Arc::new(hash_array),
+         Arc::new(content_array),
+         Arc::new(start_line_array),
+         Arc::new(end_line_array),
+         Arc::new(vector_array),
+         Arc::new(colbert_array),
+         Arc::new(colbert_scale_array),
+         Arc::new(chunk_index_array),
+         Arc::new(is_anchor_array),
+         Arc::new(chunk_type_array),
+         Arc::new(context_prev_array),
+         Arc::new(context_next_array),
+      ])
+      .map_err(|e| RsgrepError::Store(format!("failed to create record batch: {}", e)))
+   }
+
+   fn parse_chunk_type(s: &str) -> ChunkType {
+      match s {
+         "function" => ChunkType::Function,
+         "class" => ChunkType::Class,
+         "interface" => ChunkType::Interface,
+         "method" => ChunkType::Method,
+         "type_alias" => ChunkType::TypeAlias,
+         "block" => ChunkType::Block,
+         _ => ChunkType::Other,
+      }
+   }
+
+   fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+      let len = a.len().min(b.len());
+      let mut dot = 0.0;
+      for i in 0..len {
+         dot += a[i] * b[i];
+      }
+      dot
+   }
+
+   fn maxsim(query_matrix: &[Vec<f32>], doc_matrix: &[Vec<f32>]) -> f32 {
+      let mut total = 0.0;
+      for q_vec in query_matrix {
+         let mut max_score = f32::MIN;
+         for d_vec in doc_matrix {
+            let score = Self::cosine_similarity(q_vec, d_vec);
+            if score > max_score {
+               max_score = score;
+            }
+         }
+         total += max_score;
+      }
+      total
+   }
+
+   fn decode_colbert(colbert_bytes: &[u8], scale: f64) -> Vec<Vec<f32>> {
+      let mut result = Vec::new();
+      let mut i = 0;
+
+      while i + COLBERT_DIM <= colbert_bytes.len() {
+         let mut row = Vec::with_capacity(COLBERT_DIM);
+         let mut is_padding = true;
+
+         for j in 0..COLBERT_DIM {
+            let byte_val = colbert_bytes[i + j] as i8;
+            let val = (byte_val as f32 / 127.0) * scale as f32;
+            if val != 0.0 {
+               is_padding = false;
+            }
+            row.push(val);
+         }
+
+         if !is_padding {
+            result.push(row);
+         }
+
+         i += COLBERT_DIM;
+      }
+
+      result
+   }
+}
+
+impl Default for LanceStore {
+   fn default() -> Self {
+      Self::new().expect("failed to create LanceStore")
+   }
+}
+
+#[async_trait::async_trait]
+impl super::Store for LanceStore {
+   async fn insert_batch(&self, store_id: &str, records: Vec<VectorRecord>) -> Result<()> {
+      if records.is_empty() {
+         return Ok(());
+      }
+
+      let table = self.get_table(store_id).await?;
+      let batch = Self::records_to_batch(records)?;
+
+      table
+         .add(RecordBatchOnce::new(batch))
+         .execute()
+         .await
+         .map_err(|e| RsgrepError::Store(format!("failed to add records: {}", e)))?;
+
+      Ok(())
+   }
+
+   async fn search(
+      &self,
+      store_id: &str,
+      query_text: &str,
+      query_vector: &[f32],
+      query_colbert: &[Vec<f32>],
+      limit: usize,
+      path_filter: Option<&str>,
+      rerank: bool,
+   ) -> Result<SearchResponse> {
+      let table = match self.get_table(store_id).await {
+         Ok(t) => t,
+         Err(_) => {
+            return Ok(SearchResponse {
+               results:  vec![],
+               status:   SearchStatus::Ready,
+               progress: None,
+            });
+         },
+      };
+
+      let doc_clause =
+         "(path LIKE '%.md' OR path LIKE '%.mdx' OR path LIKE '%.txt' OR path LIKE '%.json')";
+      let code_clause = format!("NOT {}", doc_clause);
+
+      let mut code_filter = code_clause.clone();
+      let mut doc_filter = doc_clause.to_string();
+      let mut base_filter: Option<String> = None;
+
+      if let Some(filter) = path_filter {
+         let escaped = filter.replace('\'', "''").replace('\\', "\\\\");
+         let path_clause = format!("path LIKE '{}%'", escaped);
+         code_filter = format!("{} AND {}", path_clause, code_clause);
+         doc_filter = format!("{} AND {}", path_clause, doc_clause);
+         base_filter = Some(path_clause);
+      }
+
+      let code_results_stream = table
+         .query()
+         .nearest_to(query_vector)
+         .map_err(|e| RsgrepError::Store(format!("failed to create vector query: {}", e)))?
+         .limit(300)
+         .only_if(&code_filter)
+         .execute()
+         .await
+         .map_err(|e| RsgrepError::Store(format!("failed to execute code search: {}", e)))?;
+
+      let doc_results_stream = table
+         .query()
+         .nearest_to(query_vector)
+         .map_err(|e| RsgrepError::Store(format!("failed to create vector query: {}", e)))?
+         .only_if(&doc_filter)
+         .limit(50)
+         .execute()
+         .await
+         .map_err(|e| RsgrepError::Store(format!("failed to execute doc search: {}", e)))?;
+
+      let code_batches: Vec<RecordBatch> = code_results_stream
+         .try_collect()
+         .await
+         .map_err(|e| RsgrepError::Store(format!("failed to collect code results: {}", e)))?;
+
+      let doc_batches: Vec<RecordBatch> = doc_results_stream
+         .try_collect()
+         .await
+         .map_err(|e| RsgrepError::Store(format!("failed to collect doc results: {}", e)))?;
+
+      let fts_query = FullTextSearchQuery::new(query_text.to_owned());
+      let mut fts_query_builder = table.query().full_text_search(fts_query);
+
+      if let Some(ref filter) = base_filter {
+         fts_query_builder = fts_query_builder.only_if(filter);
+      }
+
+      let fts_batches: Vec<RecordBatch> = match fts_query_builder.limit(50).execute().await {
+         Ok(stream) => stream.try_collect().await.unwrap_or_default(),
+         Err(_) => vec![],
+      };
+
+      let mut candidates = Vec::new();
+      let mut seen_keys = HashMap::new();
+
+      for batch in code_batches
+         .iter()
+         .chain(doc_batches.iter())
+         .chain(fts_batches.iter())
+      {
+         let path_col = batch
+            .column_by_name("path")
+            .ok_or_else(|| RsgrepError::Store("missing path column".to_string()))?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| RsgrepError::Store("path column type mismatch".to_string()))?;
+
+         let start_line_col = batch
+            .column_by_name("start_line")
+            .ok_or_else(|| RsgrepError::Store("missing start_line column".to_string()))?
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| RsgrepError::Store("start_line type mismatch".to_string()))?;
+
+         for i in 0..batch.num_rows() {
+            if path_col.is_null(i) {
+               continue;
+            }
+
+            let path = path_col.value(i).to_string();
+            let start_line = start_line_col.value(i);
+
+            let key = format!("{}:{}", path, start_line);
+            if seen_keys.contains_key(&key) {
+               continue;
+            }
+            seen_keys.insert(key, ());
+
+            candidates.push((i, batch.clone()));
+         }
+      }
+
+      let mut scored_results = Vec::new();
+
+      for (row_idx, batch) in candidates {
+         let path = batch
+            .column_by_name("path")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(row_idx)
+            .to_string();
+
+         let content_col = batch.column_by_name("content").unwrap();
+         let content = if let Some(str_array) = content_col.as_any().downcast_ref::<StringArray>() {
+            str_array.value(row_idx).to_string()
+         } else if let Some(large_str_array) =
+            content_col.as_any().downcast_ref::<LargeStringArray>()
+         {
+            large_str_array.value(row_idx).to_string()
+         } else {
+            return Err(RsgrepError::Store("content column type mismatch".to_string()));
+         };
+
+         let start_line = batch
+            .column_by_name("start_line")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap()
+            .value(row_idx);
+
+         let end_line = batch
+            .column_by_name("end_line")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap()
+            .value(row_idx);
+
+         let chunk_type = batch
+            .column_by_name("chunk_type")
+            .and_then(|col| {
+               if col.is_null(row_idx) {
+                  None
+               } else {
+                  col.as_any()
+                     .downcast_ref::<StringArray>()
+                     .map(|arr| Self::parse_chunk_type(arr.value(row_idx)))
+               }
+            });
+
+         let is_anchor = batch
+            .column_by_name("is_anchor")
+            .and_then(|col| {
+               if col.is_null(row_idx) {
+                  None
+               } else {
+                  col.as_any()
+                     .downcast_ref::<BooleanArray>()
+                     .map(|arr| arr.value(row_idx))
+               }
+            });
+
+         let vector_list = batch
+            .column_by_name("vector")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .ok_or_else(|| RsgrepError::Store("vector column type mismatch".to_string()))?;
+         let vector_values = vector_list.value(row_idx);
+         let vector_floats = vector_values
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .ok_or_else(|| RsgrepError::Store("vector values type mismatch".to_string()))?;
+
+         let doc_vector: Vec<f32> = (0..vector_floats.len())
+            .map(|i| vector_floats.value(i))
+            .collect();
+
+         let mut score = Self::cosine_similarity(query_vector, &doc_vector);
+
+         if rerank
+            && !query_colbert.is_empty()
+            && let Some(colbert_col) = batch.column_by_name("colbert")
+            && !colbert_col.is_null(row_idx)
+         {
+            let colbert_binary = if let Some(large_binary_array) =
+               colbert_col.as_any().downcast_ref::<LargeBinaryArray>()
+            {
+               large_binary_array.value(row_idx)
+            } else {
+               &[]
+            };
+
+            if !colbert_binary.is_empty() {
+               let scale = if let Some(scale_col) = batch.column_by_name("colbert_scale") {
+                  if !scale_col.is_null(row_idx) {
+                     scale_col
+                        .as_any()
+                        .downcast_ref::<Float64Array>()
+                        .map(|arr| arr.value(row_idx))
+                        .unwrap_or(1.0)
+                  } else {
+                     1.0
+                  }
+               } else {
+                  1.0
+               };
+
+               let doc_matrix = Self::decode_colbert(colbert_binary, scale);
+               if !doc_matrix.is_empty() {
+                  score = Self::maxsim(query_colbert, &doc_matrix);
+               }
+            }
+         }
+
+         let mut full_content = String::new();
+         if let Some(prev_col) = batch.column_by_name("context_prev")
+            && !prev_col.is_null(row_idx)
+            && let Some(prev_str) = prev_col.as_any().downcast_ref::<StringArray>()
+         {
+            full_content.push_str(prev_str.value(row_idx));
+         }
+         full_content.push_str(&content);
+         if let Some(next_col) = batch.column_by_name("context_next")
+            && !next_col.is_null(row_idx)
+            && let Some(next_str) = next_col.as_any().downcast_ref::<StringArray>()
+         {
+            full_content.push_str(next_str.value(row_idx));
+         }
+
+         scored_results.push(SearchResult {
+            path,
+            content: full_content,
+            score,
+            start_line,
+            num_lines: end_line.saturating_sub(start_line).max(1),
+            chunk_type,
+            is_anchor,
+         });
+      }
+
+      scored_results.sort_by(|a, b| {
+         b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+      });
+      scored_results.truncate(limit);
+
+      Ok(SearchResponse { results: scored_results, status: SearchStatus::Ready, progress: None })
+   }
+
+   async fn delete_file(&self, store_id: &str, file_path: &str) -> Result<()> {
+      let table = self.get_table(store_id).await?;
+      let escaped_path = file_path.replace('\'', "''");
+      let predicate = format!("path = '{}'", escaped_path);
+
+      table
+         .delete(&predicate)
+         .await
+         .map_err(|e| RsgrepError::Store(format!("failed to delete file: {}", e)))?;
+
+      Ok(())
+   }
+
+   async fn delete_files(&self, store_id: &str, file_paths: &[String]) -> Result<()> {
+      if file_paths.is_empty() {
+         return Ok(());
+      }
+
+      let table = self.get_table(store_id).await?;
+      let unique_paths: Vec<_> = file_paths
+         .iter()
+         .collect::<std::collections::HashSet<_>>()
+         .into_iter()
+         .collect();
+
+      const BATCH_SIZE: usize = 900;
+      for chunk in unique_paths.chunks(BATCH_SIZE) {
+         let escaped: Vec<String> = chunk
+            .iter()
+            .map(|p| format!("'{}'", p.replace('\'', "''")))
+            .collect();
+         let predicate = format!("path IN ({})", escaped.join(","));
+
+         table
+            .delete(&predicate)
+            .await
+            .map_err(|e| RsgrepError::Store(format!("failed to delete files: {}", e)))?;
+      }
+
+      Ok(())
+   }
+
+   async fn delete_store(&self, store_id: &str) -> Result<()> {
+      let conn = self.get_connection(store_id).await?;
+
+      conn
+         .drop_table(store_id, &[])
+         .await
+         .map_err(|e| RsgrepError::Store(format!("failed to drop table: {}", e)))?;
+
+      self.connections.write().remove(store_id);
+
+      Ok(())
+   }
+
+   async fn get_info(&self, store_id: &str) -> Result<StoreInfo> {
+      let table = self.get_table(store_id).await?;
+      let row_count = table
+         .count_rows(None)
+         .await
+         .map_err(|e| RsgrepError::Store(format!("failed to count rows: {}", e)))?;
+
+      Ok(StoreInfo {
+         store_id:  store_id.to_string(),
+         row_count: row_count as u64,
+         path:      self.data_dir.join(store_id),
+      })
+   }
+
+   async fn list_files(&self, store_id: &str) -> Result<Vec<String>> {
+      let table = match self.get_table(store_id).await {
+         Ok(t) => t,
+         Err(_) => return Ok(vec![]),
+      };
+
+      let stream_result = table
+         .query()
+         .only_if("is_anchor = true")
+         .select(lancedb::query::Select::Columns(vec!["path".to_string()]))
+         .execute()
+         .await;
+
+      let stream = match stream_result {
+         Ok(s) => s,
+         Err(_) => table
+            .query()
+            .select(lancedb::query::Select::Columns(vec!["path".to_string()]))
+            .execute()
+            .await
+            .map_err(|e| RsgrepError::Store(format!("failed to execute query: {}", e)))?,
+      };
+
+      let batches: Vec<RecordBatch> = stream
+         .try_collect()
+         .await
+         .map_err(|e| RsgrepError::Store(format!("failed to collect results: {}", e)))?;
+
+      let mut paths = Vec::new();
+      let mut seen = std::collections::HashSet::new();
+
+      for batch in batches {
+         if let Some(path_col) = batch.column_by_name("path")
+            && let Some(path_array) = path_col.as_any().downcast_ref::<StringArray>()
+         {
+            for i in 0..path_array.len() {
+               if !path_array.is_null(i) {
+                  let path = path_array.value(i).to_string();
+                  if seen.insert(path.clone()) {
+                     paths.push(path);
+                  }
+               }
+            }
+         }
+      }
+
+      Ok(paths)
+   }
+
+   async fn is_empty(&self, store_id: &str) -> Result<bool> {
+      let table = match self.get_table(store_id).await {
+         Ok(t) => t,
+         Err(_) => return Ok(true),
+      };
+
+      let row_count = table
+         .count_rows(None)
+         .await
+         .map_err(|e| RsgrepError::Store(format!("failed to count rows: {}", e)))?;
+
+      Ok(row_count == 0)
+   }
+
+   async fn create_fts_index(&self, store_id: &str) -> Result<()> {
+      let table = self.get_table(store_id).await?;
+
+      table
+         .create_index(&["content"], lancedb::index::Index::FTS(Default::default()))
+         .execute()
+         .await
+         .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("already exists") {
+               return RsgrepError::Store("index already exists".to_string());
+            }
+            RsgrepError::Store(format!("failed to create FTS index: {}", e))
+         })?;
+
+      Ok(())
+   }
+
+   async fn create_vector_index(&self, store_id: &str) -> Result<()> {
+      let table = self.get_table(store_id).await?;
+
+      let row_count = table
+         .count_rows(None)
+         .await
+         .map_err(|e| RsgrepError::Store(format!("failed to count rows: {}", e)))?;
+
+      if row_count < 4000 {
+         return Ok(());
+      }
+
+      let num_partitions = (row_count / 100).max(8).min(64) as u32;
+
+      let index = lancedb::index::Index::IvfPq(
+         lancedb::index::vector::IvfPqIndexBuilder::default().num_partitions(num_partitions),
+      );
+
+      table
+         .create_index(&["vector"], index)
+         .execute()
+         .await
+         .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("already exists") {
+               return RsgrepError::Store("index already exists".to_string());
+            }
+            RsgrepError::Store(format!("failed to create vector index: {}", e))
+         })?;
+
+      Ok(())
+   }
+
+   async fn get_file_hashes(&self, store_id: &str) -> Result<HashMap<String, String>> {
+      let table = match self.get_table(store_id).await {
+         Ok(t) => t,
+         Err(_) => return Ok(HashMap::new()),
+      };
+
+      let stream_result = table
+         .query()
+         .only_if("is_anchor = true")
+         .select(lancedb::query::Select::Columns(vec!["path".to_string(), "hash".to_string()]))
+         .execute()
+         .await;
+
+      let stream = match stream_result {
+         Ok(s) => s,
+         Err(_) => table
+            .query()
+            .select(lancedb::query::Select::Columns(vec!["path".to_string(), "hash".to_string()]))
+            .execute()
+            .await
+            .map_err(|e| RsgrepError::Store(format!("failed to execute query: {}", e)))?,
+      };
+
+      let batches: Vec<RecordBatch> = stream
+         .try_collect()
+         .await
+         .map_err(|e| RsgrepError::Store(format!("failed to collect results: {}", e)))?;
+
+      let mut hashes = HashMap::new();
+
+      for batch in batches {
+         if let (Some(path_col), Some(hash_col)) =
+            (batch.column_by_name("path"), batch.column_by_name("hash"))
+            && let (Some(path_array), Some(hash_array)) = (
+               path_col.as_any().downcast_ref::<StringArray>(),
+               hash_col.as_any().downcast_ref::<StringArray>(),
+            )
+         {
+            for i in 0..path_array.len() {
+               if !path_array.is_null(i) && !hash_array.is_null(i) {
+                  let path = path_array.value(i).to_string();
+                  let hash = hash_array.value(i).to_string();
+                  hashes.insert(path, hash);
+               }
+            }
+         }
+      }
+
+      Ok(hashes)
+   }
+}

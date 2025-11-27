@@ -1,0 +1,115 @@
+# Rust Analyzer Config for Large Workspace
+
+# === Performance: Parallel & Cache ===
+numThreads = 32
+lru.capacity = 32768
+lru.query.capacities = { "SourceRootCrates" = 128 }
+
+# === Check: Selective & Fast ===
+check.workspace = false                      # Only check current crate
+check.targets = ["x86_64-unknown-linux-gnu"]
+check.allTargets = true
+check.features = "all"
+check.invocationStrategy = "once"
+checkOnSave = true
+check.command = "clippy"
+
+# === Cargo: Faster Builds ===
+cargo.buildScripts.enable = true
+cargo.target = "x86_64-unknown-linux-gnu"
+cargo.allTargets = true
+cargo.features = "all"
+cargo.sysroot = "discover"
+cargo.noDefaultFeatures = false
+
+# === Proc Macros: Limit Expansion ===
+procMacro.enable = true
+procMacro.attributes.enable = true
+procMacro.ignored = {}
+
+# === Diagnostics: Less Noise ===
+diagnostics.disabled = ["unresolved-proc-macro", "macro-error", "inactive-code"]
+diagnostics.experimental.enable = false
+
+# === Completion: Fast ===
+completion.autoimport.enable = true
+completion.autoself.enable = true
+completion.callable.snippets = "fill_arguments"
+completion.limit = 50                           # Reduce from default
+
+# === Inlay Hints: Minimal ===
+inlayHints.bindingModeHints.enable = false
+inlayHints.chainingHints.enable = true
+inlayHints.closingBraceHints.minLines = 10
+inlayHints.closureReturnTypeHints.enable = "with_block"
+inlayHints.lifetimeElisionHints.enable = "skip_trivial"
+inlayHints.maxLength = 25
+inlayHints.parameterHints.enable = true
+inlayHints.typeHints.enable = true
+inlayHints.typeHints.hideClosureInitialization = true
+inlayHints.typeHints.hideNamedConstructor = true
+
+# === Lens: Disable Expensive Ones ===
+lens.enable = true
+lens.references.adt.enable = false
+lens.references.enumVariant.enable = false
+lens.references.method.enable = false
+lens.references.trait.enable = false
+lens.run.enable = true
+lens.debug.enable = true
+
+# === Hover: Limit ===
+hover.actions.references.enable = false
+hover.documentation.keywords.enable = false
+hover.links.enable = true
+hover.memoryLayout.enable = false
+
+# === Imports ===
+imports.granularity.enforce = true
+imports.granularity.group = "crate"
+imports.prefix = "crate"
+imports.preferNoStd = false
+imports.preferPrelude = true
+
+# === Workspace Symbol Search ===
+workspace.symbol.search.kind = "only_types" # Faster
+workspace.symbol.search.limit = 128
+workspace.symbol.search.scope = "workspace"
+
+# === Files: Exclude Heavy Dirs ===
+files.excludeDirs = [
+   ".git",
+   ".github",
+   ".vscode",
+   ".cargo",
+   "target",
+   "node_modules",
+   "attic",
+   "specs",
+   ".crush",
+   ".claude",
+]
+files.watcher = "server"
+
+# === CRITICAL: Reduce Processing (681 deps will still index) ===
+cargo.loadOutDirsFromCheck = false # Skip build script outputs
+# Note: Can't prevent dep indexing without breaking goto-def
+# Focus: make typing responsive instead
+
+# === Assists: Minimal ===
+assist.emitMustUse = false
+assist.expressionFillDefault = "default"
+
+# === Notifications ===
+notifications.cargoTomlNotFound = false
+
+# === Rustfmt ===
+rustfmt.extraArgs = []
+rustfmt.rangeFormatting.enable = false
+
+# === Semantic Highlighting ===
+semanticHighlighting.operator.enable = true
+semanticHighlighting.operator.specialization.enable = true
+
+# === Typing ===
+typing.autoClosingAngleBrackets.enable = false
