@@ -84,18 +84,22 @@ fn is_test_file(path: &Path) -> bool {
 }
 
 fn is_doc_or_config(path: &Path) -> bool {
+   if path.extension().is_some_and(|ext| {
+      ext.eq_ignore_ascii_case("md")
+         || ext.eq_ignore_ascii_case("mdx")
+         || ext.eq_ignore_ascii_case("txt")
+         || ext.eq_ignore_ascii_case("json")
+         || ext.eq_ignore_ascii_case("yaml")
+         || ext.eq_ignore_ascii_case("yml")
+         || ext.eq_ignore_ascii_case("lock")
+   }) {
+      return true;
+   }
+
    let Some(path_str) = path.to_str() else {
       return false;
    };
-   let lower = path_str.to_lowercase();
-   lower.ends_with(".md")
-      || lower.ends_with(".mdx")
-      || lower.ends_with(".txt")
-      || lower.ends_with(".json")
-      || lower.ends_with(".yaml")
-      || lower.ends_with(".yml")
-      || lower.ends_with(".lock")
-      || lower.contains("/docs/")
+   path_str.to_lowercase().contains("/docs/")
 }
 
 #[cfg(test)]

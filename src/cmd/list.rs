@@ -1,10 +1,10 @@
-use std::{fs, path::PathBuf, time::SystemTime};
+use std::{fs, path::Path, time::SystemTime};
 
 use console::style;
 
 use crate::{Result, error::ConfigError};
 
-pub async fn execute() -> Result<()> {
+pub fn execute() -> Result<()> {
    let home = directories::UserDirs::new()
       .ok_or(ConfigError::GetUserDirectories)?
       .home_dir()
@@ -78,7 +78,7 @@ struct StoreInfo {
    modified: SystemTime,
 }
 
-fn get_dir_size(path: &PathBuf) -> Result<u64> {
+fn get_dir_size(path: &Path) -> Result<u64> {
    let mut total = 0u64;
 
    if path.is_dir() {

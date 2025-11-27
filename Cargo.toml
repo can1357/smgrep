@@ -11,7 +11,6 @@ readme = "README.md"
 keywords = ["search", "semantic", "code", "grep", "embeddings"]
 categories = ["command-line-utilities", "development-tools", "text-processing"]
 authors = ["Can Bölük <me@can.ac>"]
-rust-version = "1.85"
 
 [features]
 default = []

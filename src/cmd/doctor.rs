@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf};
+use std::{fs, path::Path};
 
 use console::style;
 
@@ -131,7 +131,7 @@ pub fn execute() -> Result<()> {
    Ok(())
 }
 
-fn check_dir(name: &str, path: &PathBuf) {
+fn check_dir(name: &str, path: &Path) {
    let exists = path.exists();
    let symbol = if exists {
       style("✓").green()
@@ -141,7 +141,7 @@ fn check_dir(name: &str, path: &PathBuf) {
    println!("{} {}: {}", symbol, name, style(path.display()).dim());
 }
 
-fn get_dir_size(path: &PathBuf) -> Result<u64> {
+fn get_dir_size(path: &Path) -> Result<u64> {
    let mut total = 0u64;
 
    if path.is_dir() {

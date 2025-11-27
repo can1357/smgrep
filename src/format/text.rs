@@ -55,7 +55,7 @@ impl HumanFormatter {
       }
    }
 
-   fn merge_adjacent_results(&self, mut results: Vec<SearchResult>) -> Vec<SearchResult> {
+   fn merge_adjacent_results(mut results: Vec<SearchResult>) -> Vec<SearchResult> {
       if results.is_empty() {
          return results;
       }
@@ -99,7 +99,7 @@ impl Formatter for HumanFormatter {
          return "No results found.".to_string();
       }
 
-      let merged = self.merge_adjacent_results(results.to_vec());
+      let merged = Self::merge_adjacent_results(results.to_vec());
       let file_count = merged
          .iter()
          .map(|r| &r.path)
@@ -138,14 +138,17 @@ impl Formatter for HumanFormatter {
             String::new()
          };
 
-         output.push_str(&format!(
-            "{}. 📂 {} {}{}{}\n",
+         use std::fmt::Write;
+         writeln!(
+            output,
+            "{}. 📂 {} {}{}{}",
             idx + 1,
             green.apply_to(result.path.display()),
             dim.apply_to(format!(":{}", result.start_line + 1)),
             tag_str,
             score_str
-         ));
+         )
+         .unwrap();
 
          let lines: Vec<String> = result.content.lines().map(|s| s.to_string()).collect();
          let max_lines = if show_content { usize::MAX } else { 12 };
@@ -162,7 +165,8 @@ impl Formatter for HumanFormatter {
 
          for (line_idx, line) in highlighted.lines().enumerate() {
             let line_num = result.start_line + line_idx as u32 + 1;
-            output.push_str(&format!("   {} │ {}\n", dim.apply_to(format!("{line_num:4}")), line));
+            use std::fmt::Write;
+            writeln!(output, "   {} │ {}", dim.apply_to(format!("{line_num:4}")), line).unwrap();
          }
 
          output.push('\n');
@@ -237,7 +241,8 @@ impl Formatter for AgentFormatter {
             format!(" [{}]", tags.join(","))
          };
 
-         output.push_str(&format!("{}:{}{}\n", result.path.display(), line, tag_str));
+         use std::fmt::Write;
+         writeln!(output, "{}:{}{}", result.path.display(), line, tag_str).unwrap();
 
          let lines = Self::clean_snippet_lines(&result.content);
          let display_lines = if lines.len() > max_lines {
@@ -249,17 +254,16 @@ impl Formatter for AgentFormatter {
          };
 
          for line in display_lines {
-            output.push_str(&format!("  {line}\n"));
+            use std::fmt::Write;
+            writeln!(output, "  {line}").unwrap();
          }
 
          output.push('\n');
       }
 
-      output.push_str(&format!(
-         "osgrep results ({} matches across {} files)",
-         results.len(),
-         file_count
-      ));
+      use std::fmt::Write;
+      write!(output, "osgrep results ({} matches across {} files)", results.len(), file_count)
+         .unwrap();
 
       output.trim().to_string()
    }

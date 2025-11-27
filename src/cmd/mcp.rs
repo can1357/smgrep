@@ -1,6 +1,7 @@
 use std::{
    io::{BufRead, Write},
-   path::PathBuf,
+   path::{Path, PathBuf},
+   process::{Command, Stdio},
 };
 
 use serde::{Deserialize, Serialize};
@@ -16,7 +17,7 @@ use crate::{
 
 #[derive(Deserialize)]
 struct JsonRpcRequest {
-   #[allow(dead_code)]
+   #[allow(dead_code, reason = "jsonrpc field is required by JSON-RPC spec but not used in code")]
    jsonrpc: String,
    id:      Option<Value>,
    method:  String,
@@ -86,9 +87,10 @@ impl DaemonConn {
          Response::Search(search_response) => {
             let mut output = String::new();
             for r in search_response.results {
-               output.push_str(&format!("{}:{}\n", r.path.display(), r.start_line));
+               use std::fmt::Write;
+               writeln!(output, "{}:{}", r.path.display(), r.start_line).unwrap();
                for line in r.content.lines().take(10) {
-                  output.push_str(&format!("  {line}\n"));
+                  writeln!(output, "  {line}").unwrap();
                }
                output.push('\n');
             }
@@ -104,15 +106,21 @@ impl DaemonConn {
 }
 
 pub async fn execute() -> Result<()> {
-   let stdin = std::io::stdin();
-   let stdout = std::io::stdout();
-   let mut stdout = stdout.lock();
-
    let cwd = std::env::current_dir()?;
    let mut conn: Option<DaemonConn> = None;
 
-   for line in stdin.lock().lines() {
-      let line = line?;
+   let stdin = std::io::stdin();
+
+   loop {
+      let line = {
+         let mut lines = stdin.lock().lines();
+         match lines.next() {
+            Some(Ok(l)) => l,
+            Some(Err(e)) => return Err(e.into()),
+            None => break,
+         }
+      };
+
       if line.is_empty() {
          continue;
       }
@@ -121,6 +129,7 @@ pub async fn execute() -> Result<()> {
          Ok(r) => r,
          Err(e) => {
             let response = JsonRpcResponse::error(Value::Null, -32700, format!("Parse error: {e}"));
+            let mut stdout = std::io::stdout().lock();
             serde_json::to_writer(&mut stdout, &response)?;
             stdout.flush()?;
             continue;
@@ -128,12 +137,13 @@ pub async fn execute() -> Result<()> {
       };
 
       let id = request.id.clone().unwrap_or(Value::Null);
-      let response = handle_request(request, &cwd, &mut conn).await;
+      let response = handle_request(request, cwd.as_path(), &mut conn).await;
       let response = match response {
          Ok(result) => JsonRpcResponse::success(id, result),
          Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
       };
 
+      let mut stdout = std::io::stdout().lock();
       serde_json::to_writer(&mut stdout, &response)?;
       stdout.flush()?;
    }
@@ -143,7 +153,7 @@ pub async fn execute() -> Result<()> {
 
 async fn handle_request(
    request: JsonRpcRequest,
-   cwd: &PathBuf,
+   cwd: &Path,
    conn: &mut Option<DaemonConn>,
 ) -> Result<Value> {
    match request.method.as_str() {
@@ -192,14 +202,14 @@ async fn handle_request(
             .params
             .get("arguments")
             .cloned()
-            .unwrap_or(json!({}));
+            .unwrap_or_else(|| json!({}));
 
          match name {
             "sem_search" => {
                let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
                let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
 
-               let result = do_search_with_retry(cwd, conn, query, limit).await?;
+               let result = do_search_with_retry(cwd.to_path_buf(), conn, query, limit).await?;
                Ok(json!({
                   "content": [{
                      "type": "text",
@@ -216,7 +226,7 @@ async fn handle_request(
 }
 
 async fn do_search_with_retry(
-   cwd: &PathBuf,
+   cwd: PathBuf,
    conn: &mut Option<DaemonConn>,
    query: &str,
    limit: usize,
@@ -231,20 +241,20 @@ async fn do_search_with_retry(
       Ok(result)
    } else {
       // Connection failed, reconnect and retry once
-      *conn = Some(DaemonConn::connect(cwd.clone()).await?);
+      *conn = Some(DaemonConn::connect(cwd).await?);
       conn.as_mut().unwrap().search(query, limit).await
    }
 }
 
-fn spawn_daemon(path: &PathBuf) -> Result<()> {
+fn spawn_daemon(path: &Path) -> Result<()> {
    let exe = std::env::current_exe()?;
-   std::process::Command::new(&exe)
+   Command::new(&exe)
       .arg("serve")
       .arg("--path")
       .arg(path)
-      .stdin(std::process::Stdio::null())
-      .stdout(std::process::Stdio::null())
-      .stderr(std::process::Stdio::null())
+      .stdin(Stdio::null())
+      .stdout(Stdio::null())
+      .stderr(Stdio::null())
       .spawn()?;
    Ok(())
 }

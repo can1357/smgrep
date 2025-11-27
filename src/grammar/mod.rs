@@ -1,5 +1,5 @@
 use std::{
-   collections::HashMap,
+   collections::{HashMap, HashSet},
    fs, io,
    path::{Path, PathBuf},
 };
@@ -64,7 +64,7 @@ pub struct GrammarManager {
    grammars_dir:  PathBuf,
    engine:        wasmtime::Engine,
    languages:     RwLock<HashMap<String, Language>>,
-   downloading:   RwLock<HashMap<String, ()>>,
+   downloading:   RwLock<HashSet<String>>,
    auto_download: bool,
 }
 
@@ -100,7 +100,7 @@ impl GrammarManager {
          grammars_dir,
          engine,
          languages: RwLock::new(HashMap::new()),
-         downloading: RwLock::new(HashMap::new()),
+         downloading: RwLock::new(HashSet::new()),
          auto_download,
       })
    }
@@ -227,10 +227,10 @@ impl GrammarManager {
 
          {
             let mut downloading = self.downloading.write();
-            if downloading.contains_key(lang) {
+            if downloading.contains(lang) {
                return Ok(None);
             }
-            downloading.insert(lang.to_string(), ());
+            downloading.insert(lang.to_string());
          }
 
          let result = self.download_grammar_sync(lang);
@@ -262,9 +262,8 @@ impl GrammarManager {
          None => return Ok(None),
       };
 
-      let lang = match Self::extension_to_language(&ext) {
-         Some(l) => l,
-         None => return Ok(None),
+      let Some(lang) = Self::extension_to_language(&ext) else {
+         return Ok(None);
       };
 
       self.get_language(lang)

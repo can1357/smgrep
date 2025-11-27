@@ -34,7 +34,7 @@ fn run_claude_command(args: &[&str]) -> Result<()> {
    Ok(())
 }
 
-pub async fn execute() -> Result<()> {
+pub fn execute() -> Result<()> {
    println!(
       "{}",
       style("Installing smgrep plugin for Claude Code...")

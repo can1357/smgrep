@@ -19,20 +19,21 @@ pub fn path_to_store_key(path: &Path) -> String {
    }
 }
 
+pub struct SearchParams<'a> {
+   pub store_id:      &'a str,
+   pub query_text:    &'a str,
+   pub query_vector:  &'a [f32],
+   pub query_colbert: &'a [Vec<f32>],
+   pub limit:         usize,
+   pub path_filter:   Option<&'a Path>,
+   pub rerank:        bool,
+}
+
 #[async_trait::async_trait]
 pub trait Store: Send + Sync {
    async fn insert_batch(&self, store_id: &str, records: Vec<VectorRecord>) -> Result<()>;
 
-   async fn search(
-      &self,
-      store_id: &str,
-      query_text: &str,
-      query_vector: &[f32],
-      query_colbert: &[Vec<f32>],
-      limit: usize,
-      path_filter: Option<&Path>,
-      rerank: bool,
-   ) -> Result<SearchResponse>;
+   async fn search(&self, params: SearchParams<'_>) -> Result<SearchResponse>;
 
    async fn delete_file(&self, store_id: &str, file_path: &Path) -> Result<()>;
 
@@ -59,19 +60,8 @@ impl<T: Store + ?Sized> Store for Arc<T> {
       (**self).insert_batch(store_id, records).await
    }
 
-   async fn search(
-      &self,
-      store_id: &str,
-      query_text: &str,
-      query_vector: &[f32],
-      query_colbert: &[Vec<f32>],
-      limit: usize,
-      path_filter: Option<&Path>,
-      rerank: bool,
-   ) -> Result<SearchResponse> {
-      (**self)
-         .search(store_id, query_text, query_vector, query_colbert, limit, path_filter, rerank)
-         .await
+   async fn search(&self, params: SearchParams<'_>) -> Result<SearchResponse> {
+      (**self).search(params).await
    }
 
    async fn delete_file(&self, store_id: &str, file_path: &Path) -> Result<()> {

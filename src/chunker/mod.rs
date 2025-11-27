@@ -1,17 +1,12 @@
 pub mod anchor;
 
-use std::{
-   borrow::Cow,
-   path::Path,
-   slice,
-   sync::{Arc, LazyLock},
-};
+use std::{borrow::Cow, path::Path, slice, sync::Arc};
 
-use regex::Regex;
 use tree_sitter::Language;
 
 use crate::{
    Str,
+   chunker::anchor::CONST_EXPORT_REGEX,
    error::{ChunkerError, Result},
    grammar::GrammarManager,
    types::{Chunk, ChunkType},
@@ -24,10 +19,8 @@ pub const OVERLAP_CHARS: usize = 200;
 pub const STRIDE_CHARS: usize = MAX_CHARS - OVERLAP_CHARS;
 pub const STRIDE_LINES: usize = MAX_LINES - OVERLAP_LINES;
 
-static SCREAMING_CONST: LazyLock<Regex> =
-   LazyLock::new(|| Regex::new(r"(?:^|\n)\s*(?:export\s+)?const\s+[A-Z0-9_]+\s*=").unwrap());
-
 #[derive(Clone, Debug, Default)]
+#[repr(transparent)]
 pub struct Chunker(Arc<GrammarManager>);
 
 impl Chunker {
@@ -95,12 +88,11 @@ impl Chunker {
 
          if sub_content.len() <= MAX_CHARS {
             chunks.push(Chunk::new(sub_content, i, end, ChunkType::Block, stack));
-            i += stride;
          } else {
             let split_chunks = Self::split_content_by_chars(&sub_content, i, stack);
             chunks.extend(split_chunks);
-            i += stride;
          }
+         i += stride;
       }
 
       chunks
@@ -135,7 +127,7 @@ impl Chunker {
 
       let mut cursor = root.walk();
       for child in root.named_children(&mut cursor) {
-         self.visit_node(
+         Self::visit_node(
             &child,
             content,
             slice::from_ref(&file_context),
@@ -143,8 +135,8 @@ impl Chunker {
             &mut saw_definition,
          );
 
-         let effective = self.unwrap_export(&child);
-         let is_definition = self.is_definition_node(&effective, content.as_str());
+         let effective = Self::unwrap_export(&child);
+         let is_definition = Self::is_definition_node(&effective, content.as_str());
 
          if is_definition {
             if child.start_byte() > cursor_index {
@@ -194,20 +186,19 @@ impl Chunker {
    }
 
    fn visit_node(
-      &self,
       node: &tree_sitter::Node,
       content: &Str,
       stack: &[Str],
       chunks: &mut Vec<Chunk>,
       saw_definition: &mut bool,
    ) {
-      let effective = self.unwrap_export(node);
-      let is_definition = self.is_definition_node(&effective, content.as_str());
+      let effective = Self::unwrap_export(node);
+      let is_definition = Self::is_definition_node(&effective, content.as_str());
       let mut stack = Cow::Borrowed(stack);
 
       if is_definition {
          *saw_definition = true;
-         let label = self.label_for_node(&effective, content.as_str());
+         let label = Self::label_for_node(&effective, content.as_str());
          if let Some(label) = label {
             stack.to_mut().push(label.into());
          }
@@ -217,25 +208,25 @@ impl Chunker {
             node_text,
             effective.start_position().row,
             effective.end_position().row,
-            self.classify_node(&effective),
+            Self::classify_node(&effective),
             stack.as_ref(),
          ));
       }
 
       let mut cursor = effective.walk();
       for child in effective.named_children(&mut cursor) {
-         self.visit_node(&child, content, &stack, chunks, saw_definition);
+         Self::visit_node(&child, content, &stack, chunks, saw_definition);
       }
    }
 
-   fn unwrap_export<'a>(&self, node: &'a tree_sitter::Node) -> tree_sitter::Node<'a> {
+   fn unwrap_export<'a>(node: &'a tree_sitter::Node) -> tree_sitter::Node<'a> {
       if node.kind() == "export_statement" && node.named_child_count() > 0 {
          return node.named_child(0).unwrap();
       }
       *node
    }
 
-   fn is_definition_node(&self, node: &tree_sitter::Node, content: &str) -> bool {
+   fn is_definition_node(node: &tree_sitter::Node, content: &str) -> bool {
       let kind = node.kind();
       matches!(
          kind,
@@ -248,10 +239,10 @@ impl Chunker {
             | "interface_declaration"
             | "type_alias_declaration"
             | "type_declaration"
-      ) || self.is_top_level_value_def(node, content)
+      ) || Self::is_top_level_value_def(node, content)
    }
 
-   fn is_top_level_value_def(&self, node: &tree_sitter::Node, content: &str) -> bool {
+   fn is_top_level_value_def(node: &tree_sitter::Node, content: &str) -> bool {
       let kind = node.kind();
       if kind != "lexical_declaration" && kind != "variable_declaration" {
          return false;
@@ -276,14 +267,14 @@ impl Chunker {
          return true;
       }
 
-      if SCREAMING_CONST.is_match(text) {
+      if CONST_EXPORT_REGEX.is_match(text) {
          return true;
       }
 
       false
    }
 
-   fn classify_node(&self, node: &tree_sitter::Node) -> ChunkType {
+   fn classify_node(node: &tree_sitter::Node) -> ChunkType {
       let kind = node.kind();
       if kind.contains("class") {
          ChunkType::Class
@@ -296,7 +287,7 @@ impl Chunker {
       }
    }
 
-   fn get_node_name(&self, node: &tree_sitter::Node, content: &str) -> Option<String> {
+   fn get_node_name(node: &tree_sitter::Node, content: &str) -> Option<String> {
       if let Some(name_node) = node.child_by_field_name("name") {
          let name = &content[name_node.start_byte()..name_node.end_byte()];
          return Some(name.to_string());
@@ -324,7 +315,7 @@ impl Chunker {
          }
 
          if child_kind == "variable_declarator"
-            && let Some(name) = self.get_node_name(&child, content)
+            && let Some(name) = Self::get_node_name(&child, content)
          {
             return Some(name);
          }
@@ -333,8 +324,8 @@ impl Chunker {
       None
    }
 
-   fn label_for_node(&self, node: &tree_sitter::Node, content: &str) -> Option<String> {
-      let name = self.get_node_name(node, content);
+   fn label_for_node(node: &tree_sitter::Node, content: &str) -> Option<String> {
+      let name = Self::get_node_name(node, content);
       let kind = node.kind();
 
       if kind.contains("class") {
@@ -345,16 +336,14 @@ impl Chunker {
          Some(format!("Interface: {}", name.as_deref().unwrap_or("<anonymous interface>")))
       } else if kind.contains("type_alias") || kind.contains("type_declaration") {
          Some(format!("Type: {}", name.as_deref().unwrap_or("<anonymous type>")))
-      } else if kind.contains("function") {
-         Some(format!("Function: {}", name.as_deref().unwrap_or("<anonymous function>")))
-      } else if self.is_top_level_value_def(node, content) {
+      } else if kind.contains("function") || Self::is_top_level_value_def(node, content) {
          Some(format!("Function: {}", name.as_deref().unwrap_or("<anonymous function>")))
       } else {
          name.map(|n| format!("Symbol: {n}"))
       }
    }
 
-   fn split_if_too_big(&self, chunk: Chunk) -> Vec<Chunk> {
+   fn split_if_too_big(chunk: Chunk) -> Vec<Chunk> {
       let char_count = chunk.content.len();
       let lines: Vec<&str> = chunk.content.lines().collect();
       let line_count = lines.len();
@@ -369,7 +358,7 @@ impl Chunker {
 
       let mut sub_chunks = Vec::new();
       let stride = (MAX_LINES - OVERLAP_LINES).max(1);
-      let header = self.extract_header_line(&chunk.content);
+      let header = Self::extract_header_line(&chunk.content);
 
       let mut i = 0;
       while i < lines.len() {
@@ -482,7 +471,7 @@ impl Chunker {
       chunks
    }
 
-   fn extract_header_line(&self, text: &str) -> Option<String> {
+   fn extract_header_line(text: &str) -> Option<String> {
       for line in text.lines() {
          let trimmed = line.trim();
          if !trimmed.is_empty() {
@@ -499,7 +488,7 @@ impl Chunker {
 
       let chunks: Vec<Chunk> = raw_chunks
          .into_iter()
-         .flat_map(|c| self.split_if_too_big(c))
+         .flat_map(Self::split_if_too_big)
          .collect();
 
       Ok(chunks)

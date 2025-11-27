@@ -1,6 +1,6 @@
 use std::{
    collections::HashMap,
-   fmt,
+   fmt, fs,
    path::{Path, PathBuf},
 };
 
@@ -90,7 +90,7 @@ impl MetaStore {
       let path = meta_dir.join(format!("{store_id}.json"));
 
       let mut store = if path.exists() {
-         let content = std::fs::read_to_string(&path)?;
+         let content = fs::read_to_string(&path)?;
          let mut store: Self = serde_json::from_str(&content)?;
          store.path = path;
          store
@@ -144,11 +144,11 @@ impl MetaStore {
 
    pub fn save(&self) -> Result<()> {
       if let Some(parent) = self.path.parent() {
-         std::fs::create_dir_all(parent)?;
+         fs::create_dir_all(parent)?;
       }
 
       let content = serde_json::to_string_pretty(&self)?;
-      std::fs::write(&self.path, content)?;
+      fs::write(&self.path, content)?;
 
       Ok(())
    }

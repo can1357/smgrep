@@ -20,7 +20,7 @@ use crate::{
    git,
    ipc::{self, Request, Response, ServerStatus},
    meta::{FileHash, MetaStore},
-   store::{LanceStore, Store},
+   store::{LanceStore, SearchParams, Store},
    types::{PreparedChunk, SearchResponse, SearchResult, SearchStatus, VectorRecord},
    usock,
 };
@@ -253,15 +253,15 @@ impl Server {
 
       let search_result = self
          .store
-         .search(
-            &self.store_id,
-            &query,
-            &query_emb.dense,
-            &query_emb.colbert,
+         .search(SearchParams {
+            store_id: &self.store_id,
+            query_text: &query,
+            query_vector: &query_emb.dense,
+            query_colbert: &query_emb.colbert,
             limit,
-            search_path.as_deref(),
+            path_filter: search_path.as_deref(),
             rerank,
-         )
+         })
          .await;
 
       match search_result {

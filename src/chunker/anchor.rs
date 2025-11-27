@@ -1,4 +1,6 @@
-use std::path::Path;
+use std::{path::Path, sync::LazyLock};
+
+use regex::Regex;
 
 use crate::{
    Str,
@@ -110,6 +112,24 @@ fn extract_top_comments(lines: &[&str]) -> Vec<String> {
    comments
 }
 
+macro_rules! static_regex {
+   ($($name:ident = $regex:expr),* $(,)?) => {
+      $(
+         pub(crate) static $name: LazyLock<Regex> = LazyLock::new(|| Regex::new($regex).unwrap());
+      )*
+   };
+}
+
+static_regex! {
+   IMPORT_FROM_REGEX    = r#"from\s+["']([^"']+)["']"#,
+   IMPORT_REGEX         = r#"^import\s+["']([^"']+)["']"#,
+   IMPORT_AS_REGEX      = r"import\s+(?:\*\s+as\s+)?([A-Za-z0-9_$]+)",
+   REQUIRE_REGEX        = r#"require\(\s*["']([^"']+)["']\s*\)"#,
+   EXPORT_REGEX         = r"^export\s+(?:default\s+)?(class|function|const|let|var|interface|type|enum)\s+([A-Za-z0-9_$]+)",
+   EXPORT_BRACE_REGEX   = r"^export\s+\{([^}]+)\}",
+   CONST_EXPORT_REGEX   = r"(?:^|\n)\s*(?:export\s+)?const\s+[A-Z0-9_]+\s*=",
+}
+
 fn extract_imports(lines: &[&str]) -> Vec<String> {
    let mut modules = Vec::new();
    let limit = 200.min(lines.len());
@@ -121,27 +141,21 @@ fn extract_imports(lines: &[&str]) -> Vec<String> {
       }
 
       if trimmed.starts_with("import ") {
-         if let Some(caps) = regex::Regex::new(r#"from\s+["']([^"']+)["']"#)
-            .ok()
-            .and_then(|re| re.captures(trimmed))
+         if let Some(caps) = IMPORT_FROM_REGEX.captures(trimmed)
             && let Some(m) = caps.get(1)
          {
             modules.push(m.as_str().to_string());
             continue;
          }
 
-         if let Some(caps) = regex::Regex::new(r#"^import\s+["']([^"']+)["']"#)
-            .ok()
-            .and_then(|re| re.captures(trimmed))
+         if let Some(caps) = IMPORT_REGEX.captures(trimmed)
             && let Some(m) = caps.get(1)
          {
             modules.push(m.as_str().to_string());
             continue;
          }
 
-         if let Some(caps) = regex::Regex::new(r"import\s+(?:\*\s+as\s+)?([A-Za-z0-9_$]+)")
-            .ok()
-            .and_then(|re| re.captures(trimmed))
+         if let Some(caps) = IMPORT_AS_REGEX.captures(trimmed)
             && let Some(m) = caps.get(1)
          {
             modules.push(m.as_str().to_string());
@@ -159,9 +173,7 @@ fn extract_imports(lines: &[&str]) -> Vec<String> {
          continue;
       }
 
-      if let Some(caps) = regex::Regex::new(r#"require\(\s*["']([^"']+)["']\s*\)"#)
-         .ok()
-         .and_then(|re| re.captures(trimmed))
+      if let Some(caps) = REQUIRE_REGEX.captures(trimmed)
          && let Some(m) = caps.get(1)
       {
          modules.push(m.as_str().to_string());
@@ -183,19 +195,14 @@ fn extract_exports(lines: &[&str]) -> Vec<String> {
          continue;
       }
 
-      if let Some(caps) = regex::Regex::new(
-         r"^export\s+(?:default\s+)?(class|function|const|let|var|interface|type|enum)\s+([A-Za-z0-9_$]+)",
-      )
-      .ok()
-      .and_then(|re| re.captures(trimmed))
-         && let Some(m) = caps.get(2) {
-            exports.push(m.as_str().to_string());
-            continue;
-         }
+      if let Some(caps) = EXPORT_REGEX.captures(trimmed)
+         && let Some(m) = caps.get(2)
+      {
+         exports.push(m.as_str().to_string());
+         continue;
+      }
 
-      if let Some(caps) = regex::Regex::new(r"^export\s+\{([^}]+)\}")
-         .ok()
-         .and_then(|re| re.captures(trimmed))
+      if let Some(caps) = EXPORT_BRACE_REGEX.captures(trimmed)
          && let Some(m) = caps.get(1)
       {
          let names: Vec<String> = m

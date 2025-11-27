@@ -1,7 +1,11 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+   path::{Path, PathBuf},
+   sync::Arc,
+};
 
 use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
+use walkdir::WalkDir;
 
 use crate::{
    Result,
@@ -40,7 +44,7 @@ pub async fn execute(
 
    if dry_run {
       spinner.set_message("Scanning files (dry run)...");
-      let file_count = scan_files(&index_path)?;
+      let file_count = scan_files(&index_path);
       spinner.finish_with_message(format!("Dry run complete: would index {file_count} files"));
       println!("\nWould index files in: {}", index_path.display());
       println!("Store ID: {resolved_store_id}");
@@ -75,7 +79,7 @@ pub async fn execute(
    Ok(())
 }
 
-async fn delete_store(store_id: &str, index_path: &PathBuf) -> Result<()> {
+async fn delete_store(store_id: &str, index_path: &Path) -> Result<()> {
    let store = LanceStore::new()?;
 
    store.delete_store(store_id).await?;
@@ -87,10 +91,10 @@ async fn delete_store(store_id: &str, index_path: &PathBuf) -> Result<()> {
    Ok(())
 }
 
-fn scan_files(path: &PathBuf) -> Result<usize> {
+fn scan_files(path: &Path) -> usize {
    let mut count = 0;
    if path.is_dir() {
-      for entry in walkdir::WalkDir::new(path)
+      for entry in WalkDir::new(path)
          .follow_links(false)
          .into_iter()
          .filter_map(|e| e.ok())
@@ -105,7 +109,7 @@ fn scan_files(path: &PathBuf) -> Result<usize> {
          }
       }
    }
-   Ok(count)
+   count
 }
 
 #[derive(Debug)]
@@ -115,7 +119,7 @@ struct IndexResult {
 }
 
 async fn index_files(
-   path: &PathBuf,
+   path: &Path,
    store_id: &str,
    callback: &mut dyn SyncProgressCallback,
 ) -> Result<IndexResult> {

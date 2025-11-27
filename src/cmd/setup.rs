@@ -1,4 +1,8 @@
-use std::{fs, path::PathBuf, time::Duration};
+use std::{
+   fs,
+   path::{Path, PathBuf},
+   time::Duration,
+};
 
 use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -55,7 +59,7 @@ pub async fn execute() -> Result<()> {
    Ok(())
 }
 
-fn check_dir(name: &str, path: &PathBuf) {
+fn check_dir(name: &str, path: &Path) {
    let exists = path.exists();
    let symbol = if exists {
       style("✓").green()
@@ -65,7 +69,7 @@ fn check_dir(name: &str, path: &PathBuf) {
    println!("{} {}: {}", symbol, name, style(path.display()).dim());
 }
 
-async fn download_models(models_dir: &PathBuf) -> Result<()> {
+async fn download_models(models_dir: &Path) -> Result<()> {
    let cfg = config::get();
    let models = [&cfg.dense_model, &cfg.colbert_model];
    for model_id in models {
@@ -107,7 +111,7 @@ async fn download_models(models_dir: &PathBuf) -> Result<()> {
    Ok(())
 }
 
-async fn download_grammars(grammars_dir: &PathBuf) -> Result<()> {
+async fn download_grammars(grammars_dir: &Path) -> Result<()> {
    let grammar_manager = GrammarManager::with_auto_download(false)?;
 
    for (lang, _url) in GRAMMAR_URLS {

@@ -1,7 +1,10 @@
 use std::{path::PathBuf, sync::LazyLock};
 
 use clap::{Parser, Subcommand};
-use smgrep::{Result, cmd};
+use smgrep::{
+   Result,
+   cmd::{self, search::SearchOptions},
+};
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
 
@@ -141,10 +144,7 @@ async fn main() -> Result<()> {
 
    if cli.command.is_none() && !cli.query.is_empty() {
       let query = cli.query.join(" ");
-      return cmd::search::execute(
-         query, None, 10, 1, false, false, false, false, false, false, false, false, cli.store,
-      )
-      .await;
+      return cmd::search::execute(query, None, 10, 1, SearchOptions::default(), cli.store).await;
    }
 
    match cli.command {
@@ -163,8 +163,12 @@ async fn main() -> Result<()> {
          plain,
       }) => {
          cmd::search::execute(
-            query, path, max, per_file, content, compact, scores, sync, dry_run, json, no_rerank,
-            plain, cli.store,
+            query,
+            path,
+            max,
+            per_file,
+            SearchOptions { content, compact, scores, sync, dry_run, json, no_rerank, plain },
+            cli.store,
          )
          .await
       },
@@ -177,8 +181,8 @@ async fn main() -> Result<()> {
       Some(Cmd::Status) => cmd::status::execute().await,
       Some(Cmd::Setup) => cmd::setup::execute().await,
       Some(Cmd::Doctor) => cmd::doctor::execute(),
-      Some(Cmd::List) => cmd::list::execute().await,
-      Some(Cmd::ClaudeInstall) => cmd::claude_install::execute().await,
+      Some(Cmd::List) => cmd::list::execute(),
+      Some(Cmd::ClaudeInstall) => cmd::claude_install::execute(),
       Some(Cmd::Mcp) => cmd::mcp::execute().await,
       None => {
          eprintln!("No command or query provided. Use --help for usage information.");

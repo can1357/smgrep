@@ -1,4 +1,8 @@
-use std::{path::PathBuf, sync::OnceLock};
+use std::{
+   fs,
+   path::{Path, PathBuf},
+   sync::OnceLock,
+};
 
 use directories::BaseDirs;
 use figment::{
@@ -80,13 +84,13 @@ impl Config {
          .unwrap_or_default()
    }
 
-   fn create_default_config(path: &std::path::Path) {
+   fn create_default_config(path: &Path) {
       if let Some(parent) = path.parent() {
-         let _ = std::fs::create_dir_all(parent);
+         let _ = fs::create_dir_all(parent);
       }
       let default_config = Self::default();
       if let Ok(toml) = toml::to_string_pretty(&default_config) {
-         let _ = std::fs::write(path, toml);
+         let _ = fs::write(path, toml);
       }
    }
 

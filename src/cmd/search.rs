@@ -1,5 +1,5 @@
 use std::{
-   path::PathBuf,
+   path::{Path, PathBuf},
    process::{Command, Stdio},
    sync::Arc,
    time::Duration,
@@ -44,20 +44,32 @@ struct JsonOutput {
    results: Vec<SearchResult>,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[derive(Default, Debug, Clone, Copy)]
+pub struct SearchOptions {
+   pub content:   bool,
+   pub compact:   bool,
+   pub scores:    bool,
+   pub sync:      bool,
+   pub dry_run:   bool,
+   pub json:      bool,
+   pub no_rerank: bool,
+   pub plain:     bool,
+}
+
+#[derive(Default, Debug, Clone, Copy)]
+struct FormatOptions {
+   content: bool,
+   compact: bool,
+   scores:  bool,
+   plain:   bool,
+}
+
 pub async fn execute(
    query: String,
    path: Option<PathBuf>,
    max: usize,
    per_file: usize,
-   content: bool,
-   compact: bool,
-   scores: bool,
-   sync: bool,
-   dry_run: bool,
-   json: bool,
-   no_rerank: bool,
-   plain: bool,
+   options: SearchOptions,
    store_id: Option<String>,
 ) -> Result<()> {
    let root = std::env::current_dir()?;
@@ -66,28 +78,34 @@ pub async fn execute(
    let resolved_store_id = store_id.map_or_else(|| git::resolve_store_id(&search_path), Ok)?;
 
    if let Some(results) =
-      try_daemon_search(&query, max, !no_rerank, &search_path, &resolved_store_id).await?
+      try_daemon_search(&query, max, !options.no_rerank, &search_path, &resolved_store_id).await?
    {
-      if json {
+      if options.json {
          println!("{}", serde_json::to_string(&JsonOutput { results })?);
       } else {
-         format_results(&results, &query, &root, content, compact, scores, plain)?;
+         let format_opts = FormatOptions {
+            content: options.content,
+            compact: options.compact,
+            scores:  options.scores,
+            plain:   options.plain,
+         };
+         format_results(&results, &query, &root, format_opts);
       }
       return Ok(());
    }
 
-   if dry_run {
-      if json {
+   if options.dry_run {
+      if options.json {
          println!("{}", serde_json::to_string(&JsonOutput { results: vec![] })?);
       } else {
-         println!("Dry run: would search for '{query}' in {search_path:?}");
+         println!("Dry run: would search for '{query}' in {}", search_path.display());
          println!("Store ID: {resolved_store_id}");
          println!("Max results: {max}");
       }
       return Ok(());
    }
 
-   if sync && !json {
+   if options.sync && !options.json {
       let spinner = ProgressBar::new_spinner();
       spinner.set_style(
          ProgressStyle::default_spinner()
@@ -103,24 +121,31 @@ pub async fn execute(
    }
 
    let results =
-      perform_search(&query, &search_path, &resolved_store_id, max, per_file, !no_rerank).await?;
+      perform_search(&query, &search_path, &resolved_store_id, max, per_file, !options.no_rerank)
+         .await?;
 
    if results.is_empty() {
-      if json {
+      if options.json {
          println!("{}", serde_json::to_string(&JsonOutput { results: vec![] })?);
       } else {
          println!("No results found for '{query}'");
-         if !sync {
+         if !options.sync {
             println!("\nTip: Use --sync to re-index before searching");
          }
       }
       return Ok(());
    }
 
-   if json {
+   if options.json {
       println!("{}", serde_json::to_string(&JsonOutput { results })?);
    } else {
-      format_results(&results, &query, &root, content, compact, scores, plain)?;
+      let format_opts = FormatOptions {
+         content: options.content,
+         compact: options.compact,
+         scores:  options.scores,
+         plain:   options.plain,
+      };
+      format_results(&results, &query, &root, format_opts);
    }
 
    Ok(())
@@ -130,12 +155,10 @@ async fn try_daemon_search(
    query: &str,
    max: usize,
    rerank: bool,
-   path: &PathBuf,
+   path: &Path,
    store_id: &str,
 ) -> Result<Option<Vec<SearchResult>>> {
-   let stream = if let Ok(s) = usock::Stream::connect(store_id).await {
-      s
-   } else {
+   let Ok(stream) = usock::Stream::connect(store_id).await else {
       spawn_daemon(path)?;
 
       for _ in 0..50 {
@@ -160,10 +183,14 @@ async fn send_search_request(
    query: &str,
    max: usize,
    rerank: bool,
-   path: &PathBuf,
+   path: &Path,
 ) -> Result<Vec<SearchResult>> {
-   let request =
-      Request::Search { query: query.to_string(), limit: max, path: Some(path.clone()), rerank };
+   let request = Request::Search {
+      query: query.to_string(),
+      limit: max,
+      path: Some(path.to_path_buf()),
+      rerank,
+   };
 
    let mut buffer = ipc::SocketBuffer::new();
    buffer.send(&mut stream, &request).await?;
@@ -191,7 +218,7 @@ async fn send_search_request(
    }
 }
 
-fn spawn_daemon(path: &PathBuf) -> Result<()> {
+fn spawn_daemon(path: &Path) -> Result<()> {
    let exe = std::env::current_exe()?;
 
    Command::new(&exe)
@@ -209,7 +236,7 @@ fn spawn_daemon(path: &PathBuf) -> Result<()> {
 
 async fn perform_search(
    query: &str,
-   path: &PathBuf,
+   path: &Path,
    store_id: &str,
    max: usize,
    per_file: usize,
@@ -260,25 +287,17 @@ async fn perform_search(
    Ok(results)
 }
 
-fn format_results(
-   results: &[SearchResult],
-   query: &str,
-   root: &PathBuf,
-   content: bool,
-   compact: bool,
-   scores: bool,
-   plain: bool,
-) -> Result<()> {
+fn format_results(results: &[SearchResult], query: &str, root: &Path, options: FormatOptions) {
    const MAX_PREVIEW_LINES: usize = 12;
 
-   if compact {
+   if options.compact {
       for result in results {
          println!("{}", result.path.display());
       }
-      return Ok(());
+      return;
    }
 
-   if plain {
+   if options.plain {
       println!("\nSearch results for: {query}");
       println!("Root: {}\n", root.display());
    } else {
@@ -295,7 +314,7 @@ fn format_results(
       let start_line = result.start_line.unwrap_or(1);
       let lines: Vec<&str> = result.content.lines().collect();
       let total_lines = lines.len();
-      let show_all = content || total_lines <= MAX_PREVIEW_LINES;
+      let show_all = options.content || total_lines <= MAX_PREVIEW_LINES;
       let display_lines = if show_all {
          total_lines
       } else {
@@ -303,10 +322,10 @@ fn format_results(
       };
       let line_num_width = format!("{}", start_line + display_lines).len();
 
-      if plain {
+      if options.plain {
          print!("{}) {}:{}", i + 1, result.path.display(), start_line);
 
-         if scores {
+         if options.scores {
             print!(" (score: {:.3})", result.score);
          }
 
@@ -325,7 +344,7 @@ fn format_results(
          print!("{}", style(format!("{}) ", i + 1)).bold().cyan());
          print!("{}:{}", style(result.path.display()).green(), start_line);
 
-         if scores {
+         if options.scores {
             print!(" {}", style(format!("(score: {:.3})", result.score)).dim());
          }
 
@@ -356,6 +375,4 @@ fn format_results(
 
       println!();
    }
-
-   Ok(())
 }

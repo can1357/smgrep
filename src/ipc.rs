@@ -49,6 +49,11 @@ impl SocketBuffer {
       Self { buf: SmallVec::new() }
    }
 
+   #[allow(
+      clippy::future_not_send,
+      reason = "Generic async function with references - Send bound would be too restrictive for \
+                trait"
+   )]
    pub async fn send<W, T>(&mut self, writer: &mut W, msg: &T) -> Result<()>
    where
       W: AsyncWrite + Unpin,

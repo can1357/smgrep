@@ -253,6 +253,8 @@ impl CandleEmbedder {
          &fs::read_to_string(model_path.join("config.json")).map_err(EmbeddingError::ReadConfig)?,
       )?;
 
+      // SAFETY: VarBuilder::from_mmaped_safetensors is safe to use as it properly
+      // handles memory mapping
       let vb = unsafe {
          VarBuilder::from_mmaped_safetensors(&[model_path.join("model.safetensors")], DTYPE, device)
             .map_err(EmbeddingError::LoadWeights)?
@@ -282,6 +284,8 @@ impl CandleEmbedder {
          &fs::read_to_string(model_path.join("config.json")).map_err(EmbeddingError::ReadConfig)?,
       )?;
 
+      // SAFETY: VarBuilder::from_mmaped_safetensors is safe to use as it properly
+      // handles memory mapping
       let vb = unsafe {
          VarBuilder::from_mmaped_safetensors(&[model_path.join("model.safetensors")], DTYPE, device)
             .map_err(EmbeddingError::LoadWeights)?

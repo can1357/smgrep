@@ -115,10 +115,10 @@ where
          .filter_map(|file_path| {
             let current_mtime = get_mtime(&file_path);
 
-            if let Some(stored_mtime) = meta_store.get_mtime(&file_path) {
-               if stored_mtime == current_mtime {
-                  return None;
-               }
+            if let Some(stored_mtime) = meta_store.get_mtime(&file_path)
+               && stored_mtime == current_mtime
+            {
+               return None;
             }
 
             let content = std::fs::read(&file_path).ok()?;
