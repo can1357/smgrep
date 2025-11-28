@@ -81,7 +81,7 @@ mod tests {
       assert!((result[0][0] - 2.0).abs() < 1e-6);
       assert!((result[0][1] - 0.0).abs() < 1e-6);
       assert!((result[1][0] - (-2.0)).abs() < 1e-6);
-      assert!((result[1][1] - 1.0).abs() < 1e-3);
+      assert!((result[1][1] - (64.0 / 127.0 * 2.0)).abs() < 1e-6);
    }
 
    #[test]

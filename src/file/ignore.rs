@@ -3,15 +3,15 @@ use std::path::Path;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
 const DEFAULT_IGNORE_PATTERNS: &[&str] = &[
-   "node_modules",
-   "dist",
-   "build",
-   "out",
-   "target",
-   "__pycache__",
-   ".git",
-   ".venv",
-   "venv",
+   "**/node_modules/**",
+   "**/dist/**",
+   "**/build/**",
+   "**/out/**",
+   "**/target/**",
+   "**/__pycache__/**",
+   "**/.git/**",
+   "**/.venv/**",
+   "**/venv/**",
    "*.lock",
    "*.bin",
    "*.ipynb",
@@ -28,9 +28,9 @@ const DEFAULT_IGNORE_PATTERNS: &[&str] = &[
    "*.min.js",
    "*.min.css",
    "*.map",
-   "coverage",
-   ".nyc_output",
-   ".pytest_cache",
+   "**/coverage/**",
+   "**/.nyc_output/**",
+   "**/.pytest_cache/**",
 ];
 
 pub struct IgnorePatterns {

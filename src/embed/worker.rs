@@ -184,8 +184,8 @@ impl Embedder for EmbedWorker {
 mod tests {
    use super::*;
 
-   #[test]
-   fn test_worker_creation() {
+   #[tokio::test]
+   async fn test_worker_creation() {
       let worker = EmbedWorker::new();
       assert!(worker.is_ok());
    }

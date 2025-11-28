@@ -24,3 +24,5 @@ target/
 
 # smgrep local data (should not be committed)
 .smgrep/
+
+.cargo/config.toml

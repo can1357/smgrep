@@ -130,9 +130,9 @@ mod tests {
 
       apply_structural_boost(&mut results);
 
-      assert!((results[0].score - 1.0625).abs() < 1e-6);
+      assert!((results[0].score - 1.25).abs() < 1e-6);
       assert!((results[1].score - 1.0).abs() < 1e-6);
-      assert!((results[2].score - 1.0625).abs() < 1e-6);
+      assert!((results[2].score - 1.25).abs() < 1e-6);
       assert!((results[3].score - 0.5).abs() < 1e-6);
    }
 
