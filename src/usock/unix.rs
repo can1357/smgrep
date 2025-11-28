@@ -13,21 +13,17 @@ use tokio::{
 use super::SocketError;
 use crate::{Result, config};
 
-pub fn socket_dir() -> PathBuf {
-   config::data_dir().join("socks")
-}
-
 pub fn socket_path(store_id: &str) -> PathBuf {
-   socket_dir().join(format!("{store_id}.sock"))
+   config::socket_dir().join(format!("{store_id}.sock"))
 }
 
 pub fn list_running_servers() -> Vec<String> {
-   let dir = socket_dir();
+   let dir = config::socket_dir();
    if !dir.exists() {
       return Vec::new();
    }
 
-   fs::read_dir(&dir)
+   fs::read_dir(dir)
       .into_iter()
       .flatten()
       .filter_map(|e| e.ok())

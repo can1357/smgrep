@@ -46,7 +46,7 @@ pub fn execute() -> Result<()> {
    println!("Marketplace: {}", style(marketplace_dir.display()).dim());
 
    println!("{}", style("Extracting plugin files...").dim());
-   extract_plugin_bundle(&marketplace_dir)?;
+   extract_plugin_bundle(marketplace_dir)?;
    println!("{}", style("✓ Plugin files extracted").green());
 
    let marketplace_path = marketplace_dir.to_string_lossy();

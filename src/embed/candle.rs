@@ -310,7 +310,7 @@ impl CandleEmbedder {
 
    async fn download_model(model_id: &str) -> Result<PathBuf> {
       let cache_dir = config::model_dir();
-      fs::create_dir_all(&cache_dir).map_err(EmbeddingError::CreateModelCache)?;
+      fs::create_dir_all(cache_dir).map_err(EmbeddingError::CreateModelCache)?;
 
       let api = Api::new().map_err(EmbeddingError::InitHfHub)?;
 

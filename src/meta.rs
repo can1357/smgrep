@@ -86,7 +86,7 @@ pub struct MetaStore {
 
 impl MetaStore {
    pub fn load(store_id: &str) -> Result<Self> {
-      let meta_dir = config::data_dir().join("meta");
+      let meta_dir = config::meta_dir();
       let path = meta_dir.join(format!("{store_id}.json"));
 
       let mut store = if path.exists() {

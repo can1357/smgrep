@@ -74,7 +74,7 @@ impl Config {
    pub fn load() -> Self {
       let config_path = config_file_path();
       if !config_path.exists() {
-         Self::create_default_config(&config_path);
+         Self::create_default_config(config_path);
       }
 
       Figment::from(Serialized::defaults(Self::default()))
@@ -103,25 +103,34 @@ impl Config {
    }
 }
 
-pub fn config_file_path() -> PathBuf {
-   data_dir().join("config.toml")
-}
-
 pub fn get() -> &'static Config {
    CONFIG.get_or_init(Config::load)
 }
 
-pub fn data_dir() -> PathBuf {
+pub fn base_dir() -> PathBuf {
    BaseDirs::new()
       .expect("failed to locate base directories")
       .home_dir()
       .join(".smgrep")
 }
 
-pub fn model_dir() -> PathBuf {
-   data_dir().join("models")
+macro_rules! define_paths {
+   ($($fn_name:ident: $path:literal),* $(,)?) => {
+      $(
+         pub fn $fn_name() -> &'static PathBuf {
+            static ONCE: OnceLock<PathBuf> = OnceLock::new();
+            ONCE.get_or_init(|| base_dir().join($path))
+         }
+      )*
+   };
 }
 
-pub fn marketplace_dir() -> PathBuf {
-   data_dir().join("marketplace")
+define_paths! {
+   config_file_path: "config.toml",
+   model_dir: "models",
+   marketplace_dir: "marketplace",
+   data_dir: "data",
+   grammar_dir: "grammars",
+   socket_dir: "sockets",
+   meta_dir: "meta",
 }

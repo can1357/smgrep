@@ -195,10 +195,10 @@ pub struct LanceStore {
 
 impl LanceStore {
    pub fn new() -> Result<Self> {
-      let data_dir = config::data_dir().join("data");
-      fs::create_dir_all(&data_dir)?;
+      let data_dir = config::data_dir();
+      fs::create_dir_all(data_dir)?;
 
-      Ok(Self { connections: RwLock::new(HashMap::new()), data_dir })
+      Ok(Self { connections: RwLock::new(HashMap::new()), data_dir: data_dir.clone() })
    }
 
    async fn get_connection(&self, store_id: &str) -> Result<Arc<Connection>> {

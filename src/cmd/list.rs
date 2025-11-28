@@ -2,15 +2,10 @@ use std::{fs, path::Path, time::SystemTime};
 
 use console::style;
 
-use crate::{Result, error::ConfigError};
+use crate::{Result, config};
 
 pub fn execute() -> Result<()> {
-   let home = directories::UserDirs::new()
-      .ok_or(ConfigError::GetUserDirectories)?
-      .home_dir()
-      .to_path_buf();
-
-   let data_dir = home.join(".smgrep").join("data");
+   let data_dir = config::data_dir();
 
    if !data_dir.exists() {
       println!("No stores found.");
@@ -23,7 +18,7 @@ pub fn execute() -> Result<()> {
 
    let mut stores = Vec::new();
 
-   for entry in fs::read_dir(&data_dir)? {
+   for entry in fs::read_dir(data_dir)? {
       let entry = entry?;
       let path = entry.path();
 
@@ -52,7 +47,7 @@ pub fn execute() -> Result<()> {
    println!(
       "\n{} {}",
       style(format!("Found {} store(s):", stores.len())).bold(),
-      style("(in ~/.smgrep/data)").dim()
+      style(format!("(in {})", data_dir.display())).dim()
    );
    println!();
 
@@ -66,7 +61,10 @@ pub fn execute() -> Result<()> {
       println!();
    }
 
-   println!("{}", style("To clean up a store: rm -rf ~/.smgrep/data/<store-name>").dim());
+   println!(
+      "{}",
+      style(format!("To clean up a store: rm -rf {}/<store-name>", data_dir.display())).dim()
+   );
    println!("{}", style("To use a specific store: smgrep --store <store-name> <query>").dim());
 
    Ok(())
