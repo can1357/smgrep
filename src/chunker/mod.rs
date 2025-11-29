@@ -1,3 +1,9 @@
+//! Code chunking with tree-sitter language-aware parsing.
+//!
+//! Splits source files into semantic chunks for code search and analysis.
+//! Uses tree-sitter grammars when available, falls back to line-based
+//! splitting.
+
 pub mod anchor;
 
 use std::{borrow::Cow, path::Path, slice, sync::Arc};
@@ -13,13 +19,29 @@ use crate::{
    types::{Chunk, ChunkType},
 };
 
+/// Maximum number of lines per chunk.
 pub const MAX_LINES: usize = 75;
+
+/// Maximum number of characters per chunk.
 pub const MAX_CHARS: usize = 2000;
+
+/// Number of lines to overlap between consecutive chunks.
 pub const OVERLAP_LINES: usize = 10;
+
+/// Number of characters to overlap between consecutive chunks.
 pub const OVERLAP_CHARS: usize = 200;
+
+/// Number of characters to advance between chunks (`MAX_CHARS` -
+/// `OVERLAP_CHARS`).
 pub const STRIDE_CHARS: usize = MAX_CHARS - OVERLAP_CHARS;
+
+/// Number of lines to advance between chunks (`MAX_LINES` - `OVERLAP_LINES`).
 pub const STRIDE_LINES: usize = MAX_LINES - OVERLAP_LINES;
 
+/// Splits source code into semantic chunks using tree-sitter grammars.
+///
+/// Extracts definitions (functions, classes, types) from parsed syntax trees
+/// and splits them into manageable chunks for code search.
 #[derive(Clone, Debug, Default)]
 #[repr(transparent)]
 pub struct Chunker(Arc<GrammarManager>);
@@ -222,6 +244,7 @@ impl Chunker {
       let kind = node.kind();
       matches!(
          kind,
+         // JavaScript/TypeScript/Go/C/C++/Java
          "function_declaration"
             | "function_definition"
             | "method_definition"
@@ -231,6 +254,20 @@ impl Chunker {
             | "interface_declaration"
             | "type_alias_declaration"
             | "type_declaration"
+            // Rust
+            | "function_item"
+            | "impl_item"
+            | "struct_item"
+            | "enum_item"
+            | "trait_item"
+            | "mod_item"
+            | "type_item"
+            | "const_item"
+            | "static_item"
+            // Python
+            | "function_def"
+            | "class_def"
+            | "async_function_def"
       ) || Self::is_top_level_value_def(node, content)
    }
 
@@ -279,20 +316,17 @@ impl Chunker {
       }
    }
 
-   fn get_node_name(node: &tree_sitter::Node, content: &str) -> Option<String> {
+   fn get_node_name<'a>(node: &tree_sitter::Node, content: &'a str) -> Option<&'a str> {
       if let Some(name_node) = node.child_by_field_name("name") {
-         let name = &content[name_node.start_byte()..name_node.end_byte()];
-         return Some(name.to_string());
+         return Some(&content[name_node.start_byte()..name_node.end_byte()]);
       }
 
       if let Some(property_node) = node.child_by_field_name("property") {
-         let name = &content[property_node.start_byte()..property_node.end_byte()];
-         return Some(name.to_string());
+         return Some(&content[property_node.start_byte()..property_node.end_byte()]);
       }
 
       if let Some(identifier_node) = node.child_by_field_name("identifier") {
-         let name = &content[identifier_node.start_byte()..identifier_node.end_byte()];
-         return Some(name.to_string());
+         return Some(&content[identifier_node.start_byte()..identifier_node.end_byte()]);
       }
 
       let mut cursor = node.walk();
@@ -302,8 +336,7 @@ impl Chunker {
             child_kind,
             "identifier" | "property_identifier" | "type_identifier" | "field_identifier"
          ) {
-            let name = &content[child.start_byte()..child.end_byte()];
-            return Some(name.to_string());
+            return Some(&content[child.start_byte()..child.end_byte()]);
          }
 
          if child_kind == "variable_declarator"
@@ -320,19 +353,20 @@ impl Chunker {
       let name = Self::get_node_name(node, content);
       let kind = node.kind();
 
-      if kind.contains("class") {
-         Some(format!("Class: {}", name.as_deref().unwrap_or("<anonymous class>")))
+      let (prefix, default) = if kind.contains("class") {
+         ("Class: ", "<anonymous class>")
       } else if kind.contains("method") {
-         Some(format!("Method: {}", name.as_deref().unwrap_or("<anonymous method>")))
+         ("Method: ", "<anonymous method>")
       } else if kind.contains("interface") {
-         Some(format!("Interface: {}", name.as_deref().unwrap_or("<anonymous interface>")))
+         ("Interface: ", "<anonymous interface>")
       } else if kind.contains("type_alias") || kind.contains("type_declaration") {
-         Some(format!("Type: {}", name.as_deref().unwrap_or("<anonymous type>")))
+         ("Type: ", "<anonymous type>")
       } else if kind.contains("function") || Self::is_top_level_value_def(node, content) {
-         Some(format!("Function: {}", name.as_deref().unwrap_or("<anonymous function>")))
+         ("Function: ", "<anonymous function>")
       } else {
-         name.map(|n| format!("Symbol: {n}"))
-      }
+         return name.map(|n| format!("Symbol: {n}"));
+      };
+      Some(format!("{prefix}{}", name.unwrap_or(default)))
    }
 
    fn split_if_too_big(chunk: Chunk) -> Vec<Chunk> {
@@ -363,17 +397,17 @@ impl Chunker {
          }
 
          let (start_byte, end_byte) = Self::line_range_to_byte_range(&chunk.content, i, end);
-         let sub_content = if let Some(ref h) = header
+         let mut content = chunk.content.slice(start_byte..end_byte);
+
+         if let Some(h) = header
             && i > 0
             && chunk.chunk_type != Some(ChunkType::Block)
          {
-            Str::from_string(format!("{h}\n{}", chunk.content.slice(start_byte..end_byte)))
-         } else {
-            chunk.content.slice(start_byte..end_byte)
-         };
+            content = Str::from_string(format!("{h}\n{content}"));
+         }
 
          sub_chunks.push(Chunk::new(
-            sub_content,
+            content,
             chunk.start_line + i,
             chunk.start_line + end,
             chunk.chunk_type.unwrap_or(ChunkType::Other),
@@ -395,89 +429,69 @@ impl Chunker {
          .collect()
    }
 
-   fn split_content_by_chars(input: &Str, start_line: usize, context: &[Str]) -> Vec<Chunk> {
+   fn split_by_chars_impl(
+      content: &Str,
+      start_line: usize,
+      chunk_type: ChunkType,
+      context: &[Str],
+   ) -> Vec<Chunk> {
       let mut chunks = Vec::new();
-
-      let mut iter = input.as_str();
+      let mut iter = content.as_str();
       let mut ln = start_line;
       loop {
          iter = iter.trim_start();
          if iter.is_empty() {
             break;
          }
-
          let lim = iter.floor_char_boundary(MAX_CHARS);
          let (pre, post) = iter.split_at(lim);
          iter = post;
-
-         let content = pre.trim_end();
-         if content.is_empty() {
+         let trimmed = pre.trim_end();
+         if trimmed.is_empty() {
             continue;
          }
-
-         let lines = content.lines().count();
-
-         chunks.push(Chunk::new(
-            input.slice_ref(content),
-            ln,
-            ln + lines,
-            ChunkType::Block,
-            context,
-         ));
+         let lines = trimmed.lines().count();
+         chunks.push(Chunk::new(content.slice_ref(trimmed), ln, ln + lines, chunk_type, context));
          ln += lines;
       }
-
       chunks
+   }
+
+   fn split_content_by_chars(input: &Str, start_line: usize, context: &[Str]) -> Vec<Chunk> {
+      Self::split_by_chars_impl(input, start_line, ChunkType::Block, context)
    }
 
    fn split_by_chars(chunk: Chunk) -> Vec<Chunk> {
-      let mut chunks = Vec::new();
-
-      let mut iter = chunk.content.as_str();
-      let mut ln = chunk.start_line;
-      loop {
-         iter = iter.trim_start();
-         if iter.is_empty() {
-            break;
-         }
-         let lim = iter.floor_char_boundary(MAX_CHARS);
-         let (pre, post) = iter.split_at(lim);
-         iter = post;
-         let content = pre.trim_end();
-         if content.is_empty() {
-            continue;
-         }
-
-         let lines = content.lines().count();
-
-         chunks.push(Chunk::new(
-            chunk.content.slice_ref(content),
-            ln,
-            ln + lines,
-            chunk.chunk_type.unwrap_or(ChunkType::Other),
-            &chunk.context,
-         ));
-         ln += lines;
-      }
-
-      chunks
+      Self::split_by_chars_impl(
+         &chunk.content,
+         chunk.start_line,
+         chunk.chunk_type.unwrap_or(ChunkType::Other),
+         &chunk.context,
+      )
    }
 
-   fn extract_header_line(text: &str) -> Option<String> {
-      for line in text.lines() {
-         let trimmed = line.trim();
-         if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
-         }
-      }
-      None
+   fn extract_header_line(text: &str) -> Option<&str> {
+      text.lines().map(str::trim).find(|s| !s.is_empty())
    }
 
+   /// Splits source code into semantic chunks.
+   ///
+   /// Attempts tree-sitter parsing first, falls back to line-based chunking if
+   /// parsing fails. Ensures all chunks satisfy [`MAX_LINES`] and
+   /// [`MAX_CHARS`] constraints.
    pub async fn chunk(&self, content: &Str, path: &Path) -> Result<Vec<Chunk>> {
-      let raw_chunks = self
-         .chunk_with_tree_sitter(content, path)
-         .await?
-         .unwrap_or_else(|| Self::simple_chunk(content, path));
+      let raw_chunks = match self.chunk_with_tree_sitter(content, path).await {
+         Ok(Some(c)) => c,
+         Ok(None) => Self::simple_chunk(content, path),
+         Err(e) => {
+            tracing::warn!(
+               error = %e,
+               path = %path.display(),
+               "tree-sitter chunk failed, falling back to simple chunk"
+            );
+            Self::simple_chunk(content, path)
+         },
+      };
 
       let chunks: Vec<Chunk> = raw_chunks
          .into_iter()
@@ -485,5 +499,44 @@ impl Chunker {
          .collect();
 
       Ok(chunks)
+   }
+}
+
+#[cfg(test)]
+mod tests {
+   use std::fmt::Write;
+
+   use super::*;
+
+   #[test]
+   fn split_by_chars_preserves_chunk_type() {
+      let content = Str::from_string("a".repeat(MAX_CHARS + 10));
+      let chunk = Chunk::new(content, 0, 1, ChunkType::Function, &[]);
+
+      let pieces = Chunker::split_by_chars(chunk);
+
+      assert!(!pieces.is_empty());
+      assert!(
+         pieces
+            .iter()
+            .all(|c| c.chunk_type == Some(ChunkType::Function))
+      );
+   }
+
+   #[test]
+   fn split_if_too_big_keeps_trailing_lines() {
+      let content = Str::from_string((0..131).fold(String::new(), |mut s, i| {
+         let _ = writeln!(s, "line {i}");
+         s
+      }));
+      let chunk = Chunk::new(content, 0, 131, ChunkType::Block, &[]);
+
+      let sub_chunks = Chunker::split_if_too_big(chunk);
+
+      assert!(
+         sub_chunks
+            .iter()
+            .any(|c| c.content.as_str().contains("line 130"))
+      );
    }
 }

@@ -1,4 +1,9 @@
-use std::{path::Path, sync::LazyLock};
+//! Anchor chunk generation for file context and metadata.
+//!
+//! Creates special anchor chunks containing file metadata, imports, exports,
+//! and preamble to provide context for semantic code search.
+
+use std::{fmt::Write, path::Path, sync::LazyLock};
 
 use regex::Regex;
 
@@ -7,6 +12,10 @@ use crate::{
    types::{Chunk, ChunkType},
 };
 
+/// Creates an anchor chunk containing file metadata and context.
+///
+/// Extracts top-level comments, imports, exports, and preamble to provide
+/// context for code search. Returns a special chunk marked as an anchor.
 pub fn create_anchor_chunk(content: &Str, path: &Path) -> Chunk {
    let lines: Vec<&str> = content.as_str().lines().collect();
    let top_comments = extract_top_comments(&lines);
@@ -30,29 +39,26 @@ pub fn create_anchor_chunk(content: &Str, path: &Path) -> Chunk {
       }
    }
 
-   let mut sections = Vec::new();
-   sections.push(format!("File: {}", path.display()));
+   let mut anchor_text = String::new();
+   write!(anchor_text, "File: {}", path.display()).unwrap();
 
    if !imports.is_empty() {
-      sections.push(format!("Imports: {}", imports.join(", ")));
+      write!(anchor_text, "\n\nImports: {}", imports.join(", ")).unwrap();
    }
 
    if !exports.is_empty() {
-      sections.push(format!("Exports: {}", exports.join(", ")));
+      write!(anchor_text, "\n\nExports: {}", exports.join(", ")).unwrap();
    }
 
    if !top_comments.is_empty() {
-      sections.push(format!("Top comments:\n{}", top_comments.join("\n")));
+      write!(anchor_text, "\n\nTop comments:\n{}", top_comments.join("\n")).unwrap();
    }
 
    if !preamble.is_empty() {
-      sections.push(format!("Preamble:\n{}", preamble.join("\n")));
+      write!(anchor_text, "\n\nPreamble:\n{}", preamble.join("\n")).unwrap();
    }
 
-   sections.push("---".to_string());
-   sections.push("(anchor)".to_string());
-
-   let anchor_text = sections.join("\n\n");
+   anchor_text.push_str("\n\n---\n\n(anchor)");
    let approx_end_line = lines.len().min(non_blank.max(preamble.len()).max(5));
 
    let mut chunk =
