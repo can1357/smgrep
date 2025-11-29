@@ -7045,6 +7045,7 @@ dependencies = [
  "lancedb",
  "memchr",
  "moka",
+ "ndarray",
  "notify",
  "notify-debouncer-mini",
  "num_cpus",
