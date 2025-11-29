@@ -1,3 +1,8 @@
+//! Multi-threaded embedding worker pool with timeout management
+//!
+//! Provides concurrent embedding processing with automatic worker lifecycle
+//! management and timeout-based cleanup.
+
 use std::{
    sync::{
       Arc,
@@ -40,14 +45,20 @@ impl RelativeClock {
    }
 }
 
+/// Multi-threaded embedding worker pool
+///
+/// Distributes embedding work across multiple async workers with automatic
+/// timeout management and graceful shutdown. Workers idle out after inactivity.
 pub struct EmbedWorker {
    workers:      Option<Vec<JoinHandle<()>>>,
    sender:       flume::Sender<WorkerMessage>,
    cancel_token: CancellationToken,
    batch_size:   usize,
+   embedder:     Arc<CandleEmbedder>,
 }
 
 impl EmbedWorker {
+   /// Creates a worker pool with configured number of threads
    pub fn new() -> Result<Self> {
       let cfg = config::get();
       let num_threads = cfg.default_threads();
@@ -91,13 +102,13 @@ impl EmbedWorker {
                   }
                   Some(msg) = rx.next() => {
                      // Update the last message time
-                     last_message.fetch_max(t0.time(), Ordering::Relaxed);
+                     last_message.fetch_max(t0.time(), Ordering::Release);
                      msg
                   }
                   _ = timer.tick() => {
                      // Check if the timeout has been exceeded
                      let now = t0.time();
-                     let last_msg = last_message.load(Ordering::Relaxed);
+                     let last_msg = last_message.load(Ordering::Acquire);
                      if now - last_msg > timeout_ms {
                         // Cancel the token if the timeout has been exceeded
                         cancel_token.cancel();
@@ -130,9 +141,10 @@ impl EmbedWorker {
          workers.push(handle);
       }
 
-      Ok(Self { workers: Some(workers), sender: tx, batch_size: batch_sz, cancel_token })
+      Ok(Self { workers: Some(workers), sender: tx, batch_size: batch_sz, cancel_token, embedder })
    }
 
+   /// Computes hybrid embeddings using the worker pool
    pub async fn compute_hybrid(&self, texts: &[Str]) -> Result<Vec<HybridEmbedding>> {
       if texts.is_empty() {
          return Ok(Vec::new());
@@ -171,8 +183,7 @@ impl Embedder for EmbedWorker {
    }
 
    async fn encode_query(&self, text: &str) -> Result<QueryEmbedding> {
-      let embedder = CandleEmbedder::new()?;
-      embedder.encode_query(text).await
+      self.embedder.encode_query(text).await
    }
 
    fn is_ready(&self) -> bool {
