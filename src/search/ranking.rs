@@ -1,10 +1,21 @@
-use std::{
-   collections::HashMap,
-   path::{Path, PathBuf},
-};
+//! Result ranking utilities for boosting code structure and limiting per-file
+//! results.
+
+use std::path::Path;
 
 use crate::types::{ChunkType, SearchResult};
 
+fn contains_ci(haystack: &str, needle: &str) -> bool {
+   haystack
+      .as_bytes()
+      .windows(needle.len())
+      .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+/// Applies score multipliers based on chunk type and file category.
+///
+/// Boosts functions, classes, interfaces, methods, and type aliases by 1.25x.
+/// Penalizes test files (0.85x) and documentation/config files (0.5x).
 pub fn apply_structural_boost(results: &mut [SearchResult]) {
    for result in results.iter_mut() {
       if let Some(
@@ -28,43 +39,69 @@ pub fn apply_structural_boost(results: &mut [SearchResult]) {
    }
 }
 
-pub fn deduplicate(results: Vec<SearchResult>) -> Vec<SearchResult> {
-   let mut seen: HashMap<(PathBuf, u32), usize> = HashMap::new();
+/// Deduplicates results by (path, `start_line`), keeping the highest-scoring
+/// duplicate.
+pub fn deduplicate(mut results: Vec<SearchResult>) -> Vec<SearchResult> {
+   if results.is_empty() {
+      return results;
+   }
+
+   // Sort by (path, start_line, score desc) so highest score comes first for each
+   // group
+   results.sort_by(|a, b| {
+      a.path
+         .cmp(&b.path)
+         .then_with(|| a.start_line.cmp(&b.start_line))
+         .then_with(|| {
+            b.score
+               .partial_cmp(&a.score)
+               .unwrap_or(std::cmp::Ordering::Equal)
+         })
+   });
+
+   // Deduplicate by keeping first of each (path, line) group (which has highest
+   // score)
    let mut deduplicated: Vec<SearchResult> = Vec::with_capacity(results.len());
 
    for result in results {
-      let key = (result.path.clone(), result.start_line);
-
-      if let Some(&idx) = seen.get(&key) {
-         if result.score > deduplicated[idx].score {
-            deduplicated[idx] = result;
-         }
-      } else {
-         seen.insert(key, deduplicated.len());
-         deduplicated.push(result);
+      let dominated_by_last = deduplicated
+         .last()
+         .is_some_and(|last| last.path == result.path && last.start_line == result.start_line);
+      if dominated_by_last {
+         continue;
       }
+      deduplicated.push(result);
    }
 
    deduplicated
 }
 
-pub fn apply_per_file_limit(results: Vec<SearchResult>, limit: usize) -> Vec<SearchResult> {
-   let mut by_path: HashMap<PathBuf, Vec<SearchResult>> = HashMap::new();
-
-   for result in results {
-      by_path.entry(result.path.clone()).or_default().push(result);
-   }
-
-   for results in by_path.values_mut() {
-      results.sort_by(|a, b| {
+/// Limits results to at most `limit` entries per file, preserving highest
+/// scores.
+pub fn apply_per_file_limit(mut results: Vec<SearchResult>, limit: usize) -> Vec<SearchResult> {
+   results.sort_by(|a, b| {
+      a.path.cmp(&b.path).then_with(|| {
          b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
-      });
-      results.truncate(limit);
-   }
+      })
+   });
 
-   let mut final_results: Vec<SearchResult> = by_path.into_values().flatten().collect();
+   let mut final_results: Vec<SearchResult> = Vec::with_capacity(results.len());
+   let mut count = 0;
+
+   for (i, result) in results.into_iter().enumerate() {
+      let is_new_path = i == 0 || final_results.last().unwrap().path != result.path;
+
+      if is_new_path {
+         count = 0;
+      }
+
+      if count < limit {
+         count += 1;
+         final_results.push(result);
+      }
+   }
 
    final_results.sort_by(|a, b| {
       b.score
@@ -79,8 +116,9 @@ fn is_test_file(path: &Path) -> bool {
    let Some(path_str) = path.to_str() else {
       return false;
    };
-   let lower = path_str.to_lowercase();
-   lower.contains(".test.") || lower.contains(".spec.") || lower.contains("__tests__")
+   contains_ci(path_str, ".test.")
+      || contains_ci(path_str, ".spec.")
+      || contains_ci(path_str, "__tests__")
 }
 
 fn is_doc_or_config(path: &Path) -> bool {
@@ -99,11 +137,13 @@ fn is_doc_or_config(path: &Path) -> bool {
    let Some(path_str) = path.to_str() else {
       return false;
    };
-   path_str.to_lowercase().contains("/docs/")
+   contains_ci(path_str, "/docs/")
 }
 
 #[cfg(test)]
 mod tests {
+   use std::path::PathBuf;
+
    use super::*;
    use crate::Str;
 
@@ -146,8 +186,12 @@ mod tests {
 
       let deduped = deduplicate(results);
       assert_eq!(deduped.len(), 2);
-      assert!((deduped[0].score - 2.0).abs() < 1e-6);
-      assert_eq!(deduped[0].path, Path::new("src/main.rs"));
+      // Find the main.rs result and verify the higher score (2.0) was kept
+      let main_result = deduped
+         .iter()
+         .find(|r| r.path == Path::new("src/main.rs"))
+         .unwrap();
+      assert!((main_result.score - 2.0).abs() < 1e-6);
    }
 
    #[test]

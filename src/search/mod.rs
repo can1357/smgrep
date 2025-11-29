@@ -1,3 +1,6 @@
+//! Code search engine combining vector embeddings, `ColBERT` reranking, and
+//! result ranking.
+
 pub mod colbert;
 pub mod ranking;
 
@@ -10,6 +13,8 @@ use crate::{
    types::SearchResponse,
 };
 
+/// High-level search engine orchestrating embeddings, vector search, and
+/// reranking.
 pub struct SearchEngine {
    store:    Arc<dyn Store>,
    embedder: Arc<dyn Embedder>,
@@ -20,6 +25,10 @@ impl SearchEngine {
       Self { store, embedder }
    }
 
+   /// Searches a store for code matching a natural language query.
+   ///
+   /// Performs vector search, applies structural boosting, and optionally
+   /// reranks with `ColBERT`. Results are limited both globally and per-file.
    pub async fn search(
       &self,
       store_id: &str,
