@@ -12,7 +12,7 @@
 Natural-language search that works like `grep`. Fast, local, GPU-accelerated, and built for coding agents.
 
 - **Semantic:** Finds concepts ("where do transactions get created?"), not just strings.
-- **GPU-Accelerated:** CUDA support via candle for fast embeddings on NVIDIA GPUs.
+- **GPU-Accelerated:** CUDA on NVIDIA GPUs, Metal on Apple Silicon.
 - **Local & Private:** 100% local embeddings. No API keys required.
 - **Auto-Isolated:** Each repository gets its own index automatically.
 - **On-Demand Grammars:** Tree-sitter WASM grammars download automatically as needed.

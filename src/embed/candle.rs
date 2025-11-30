@@ -227,6 +227,8 @@ fn is_oom_error(err: &str) -> bool {
    err.contains("out of memory")
       || err.contains("OUT_OF_MEMORY")
       || err.contains("CUDA_ERROR_OUT_OF_MEMORY")
+      || err.contains("MTLBuffer")
+      || err.contains("Metal")
       || err.contains("alloc")
 }
 
@@ -242,13 +244,8 @@ impl CandleEmbedder {
       let device = if cfg.disable_gpu {
          Device::Cpu
       } else {
-         Device::cuda_if_available(0).unwrap_or(Device::Cpu)
+         Self::select_device()
       };
-      if device.is_cuda() {
-         tracing::info!("using CUDA device");
-      } else {
-         tracing::info!("using CPU device");
-      }
 
       let initial_batch = cfg.batch_size();
 
@@ -258,6 +255,24 @@ impl CandleEmbedder {
          device,
          adaptive_batch_size: AtomicUsize::new(initial_batch),
       })
+   }
+
+   fn select_device() -> Device {
+      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      {
+         if let Ok(device) = Device::new_metal(0) {
+            return device;
+         }
+      }
+      #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+      {
+         if let Ok(device) = Device::cuda_if_available(0) {
+            if device.is_cuda() {
+               return device;
+            }
+         }
+      }
+      Device::Cpu
    }
 
    /// Returns the current adaptive batch size

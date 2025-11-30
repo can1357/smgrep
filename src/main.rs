@@ -134,14 +134,40 @@ enum Cmd {
    Mcp,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
    tracing_subscriber::fmt()
       .with_env_filter(EnvFilter::from_default_env().add_directive(Level::WARN.into()))
       .init();
 
    let cli = Cli::parse();
 
+   // On macOS Apple Silicon with Metal, use single-threaded runtime for the serve
+   // command. The candle Metal backend creates a command buffer at initialization
+   // and enqueues it. In multi-threaded mode, a different worker thread does the
+   // actual GPU work with its own buffer, leaving the initial buffer enqueued but
+   // uncommitted. Metal command queues block waiting for enqueued buffers to be
+   // committed in order, causing the GPU wait to hang indefinitely.
+   #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+   let is_serve = matches!(&cli.command, Some(Cmd::Serve { .. }));
+   #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+   let is_serve = false;
+
+   if is_serve {
+      tokio::runtime::Builder::new_current_thread()
+         .enable_all()
+         .build()
+         .expect("failed to build tokio runtime")
+         .block_on(run_command(cli))
+   } else {
+      tokio::runtime::Builder::new_multi_thread()
+         .enable_all()
+         .build()
+         .expect("failed to build tokio runtime")
+         .block_on(run_command(cli))
+   }
+}
+
+async fn run_command(cli: Cli) -> Result<()> {
    if cli.command.is_none() && !cli.query.is_empty() {
       let query = cli.query.join(" ");
       return cmd::search::execute(query, None, 10, 1, SearchOptions::default(), cli.store).await;
