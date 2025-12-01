@@ -22,7 +22,7 @@ use crate::{
    Result, Str,
    chunker::Chunker,
    config,
-   embed::{Embedder, candle::CandleEmbedder},
+   embed::Embedder,
    file::{FileSystem, FileWatcher, IgnorePatterns, LocalFileSystem, WatchAction},
    git,
    index_lock::IndexLock,
@@ -32,6 +32,10 @@ use crate::{
    types::{PreparedChunk, SearchResponse, SearchResult, SearchStatus, VectorRecord},
    usock, version,
 };
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use crate::embed::candle::CandleEmbedder;
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+use crate::embed::worker::EmbedWorker;
 
 /// The main server state managing indexing, search, and file watching.
 struct Server {
@@ -89,7 +93,12 @@ pub async fn execute(path: Option<PathBuf>, store_id: Option<String>) -> Result<
    println!("Store ID: {}", style(&resolved_store_id).cyan());
 
    let store: Arc<dyn Store> = Arc::new(LanceStore::new()?);
+   // EmbedWorker's parallel workers cause hangs on Metal. Use CandleEmbedder directly.
+   // This matches the single-threaded pattern used by huggingface/text-embeddings-inference.
+   #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
    let embedder: Arc<dyn Embedder> = Arc::new(CandleEmbedder::new()?);
+   #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+   let embedder: Arc<dyn Embedder> = Arc::new(EmbedWorker::new()?);
 
    if !embedder.is_ready() {
       println!("{}", style("Waiting for embedder to initialize...").yellow());

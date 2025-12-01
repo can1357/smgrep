@@ -15,7 +15,7 @@ use walkdir::WalkDir;
 use crate::{
    Result,
    chunker::Chunker,
-   embed::{Embedder, candle::CandleEmbedder},
+   embed::Embedder,
    file::LocalFileSystem,
    git,
    index_lock::IndexLock,
@@ -23,6 +23,10 @@ use crate::{
    store::{LanceStore, Store},
    sync::{SyncEngine, SyncProgressCallback},
 };
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use crate::embed::candle::CandleEmbedder;
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+use crate::embed::worker::EmbedWorker;
 
 /// Executes the index command to create or update a code index.
 pub async fn execute(
@@ -137,7 +141,12 @@ async fn index_files(
    callback: &mut dyn SyncProgressCallback,
 ) -> Result<IndexResult> {
    let file_system = LocalFileSystem::new();
+   // EmbedWorker's parallel workers cause hangs on Metal. Use CandleEmbedder directly.
+   // This matches the single-threaded pattern used by huggingface/text-embeddings-inference.
+   #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
    let embedder: Arc<dyn Embedder> = Arc::new(CandleEmbedder::new()?);
+   #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+   let embedder: Arc<dyn Embedder> = Arc::new(EmbedWorker::new()?);
    let store: Arc<dyn Store> = Arc::new(LanceStore::new()?);
 
    let sync_engine = SyncEngine::new(file_system, Chunker::default(), embedder, store);

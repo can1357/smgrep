@@ -19,7 +19,6 @@ use crate::{
    Result,
    chunker::Chunker,
    cmd::daemon,
-   embed::worker::EmbedWorker,
    error::Error,
    file::LocalFileSystem,
    git,
@@ -29,6 +28,10 @@ use crate::{
    sync::SyncEngine,
    usock,
 };
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use crate::embed::candle::CandleEmbedder;
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+use crate::embed::worker::EmbedWorker;
 
 /// A single search result with metadata and content.
 #[derive(Debug, Serialize, Deserialize)]
@@ -233,6 +236,12 @@ async fn perform_search(
    rerank: bool,
 ) -> Result<Vec<SearchResult>> {
    let store = Arc::new(LanceStore::new()?);
+
+   // EmbedWorker's parallel workers cause hangs on Metal. Use CandleEmbedder directly.
+   // This matches the single-threaded pattern used by huggingface/text-embeddings-inference.
+   #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+   let embedder = Arc::new(CandleEmbedder::new()?);
+   #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
    let embedder = Arc::new(EmbedWorker::new()?);
 
    let file_system = LocalFileSystem::new();
